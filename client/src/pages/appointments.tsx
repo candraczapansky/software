@@ -307,8 +307,9 @@ const AppointmentsPage = () => {
       // // console.log("[AppointmentsPage] ✅ Received appointments:", data.length, "appointments for date range");
       return data;
     },
-    refetchOnMount: false, // Don't always refetch on mount
-    refetchOnWindowFocus: false, // Don't refetch on window focus
+    // Allow refetching to ensure we have latest data
+    refetchOnMount: true,
+    refetchOnWindowFocus: true
     staleTime: 60000, // Consider data fresh for 1 minute
     cacheTime: 300000, // Keep cache for 5 minutes
   });
@@ -2480,8 +2481,10 @@ const AppointmentsPage = () => {
           }}
           appointmentId={selectedAppointmentId}
           onAppointmentCreated={(appointment) => {
-            // console.log("[APPOINTMENTS PAGE] onAppointmentCreated called with:", appointment);
-            refetch();
+            // Invalidate and refetch appointments
+            queryClient.invalidateQueries({ queryKey: ['/api/appointments'] });
+            queryClient.refetchQueries({ queryKey: ['/api/appointments'] });
+            
             // If editing from details, keep details open
             if (isDetailsOpen) {
               closeAppointmentForm();
