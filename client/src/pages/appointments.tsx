@@ -309,7 +309,7 @@ const AppointmentsPage = () => {
     },
     // Allow refetching to ensure we have latest data
     refetchOnMount: true,
-    refetchOnWindowFocus: true
+    refetchOnWindowFocus: true,
     staleTime: 60000, // Consider data fresh for 1 minute
     cacheTime: 300000, // Keep cache for 5 minutes
   });
