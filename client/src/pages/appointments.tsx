@@ -235,17 +235,17 @@ const AppointmentsPage = () => {
     let endDate: Date;
     
     if (calendarView === 'day') {
-      // For day view, get appointments for selected date +/- 7 days
+      // For day view, get appointments for selected date +/- 30 days
       startDate = new Date(selectedDate || now);
-      startDate.setDate(startDate.getDate() - 7);
+      startDate.setDate(startDate.getDate() - 30);
       endDate = new Date(selectedDate || now);
-      endDate.setDate(endDate.getDate() + 7);
+      endDate.setDate(endDate.getDate() + 30);
     } else if (calendarView === 'week') {
-      // For week view, get appointments for current week +/- 2 weeks
+      // For week view, get appointments for current week +/- 4 weeks
       startDate = new Date(selectedDate || now);
-      startDate.setDate(startDate.getDate() - 14);
+      startDate.setDate(startDate.getDate() - 28);
       endDate = new Date(selectedDate || now);
-      endDate.setDate(endDate.getDate() + 14);
+      endDate.setDate(endDate.getDate() + 28);
     } else {
       // For month view, get appointments for current month +/- 1 month
       startDate = new Date(selectedDate || now);
@@ -716,6 +716,7 @@ const AppointmentsPage = () => {
   }, [queryClient]);
 
   const filteredAppointments = appointments.filter((apt: any) => {
+    console.log('Filtering appointment:', apt);
     // Filter by selected location if set
     if (selectedLocation?.id) {
       // If appointment has explicit locationId, require match; otherwise infer by staff's location if available
@@ -2481,9 +2482,11 @@ const AppointmentsPage = () => {
           }}
           appointmentId={selectedAppointmentId}
           onAppointmentCreated={(appointment) => {
+            console.log('Appointment created:', appointment);
             // Invalidate and refetch appointments
             queryClient.invalidateQueries({ queryKey: ['/api/appointments'] });
             queryClient.refetchQueries({ queryKey: ['/api/appointments'] });
+            console.log('Triggered appointment refetch');
             
             // If editing from details, keep details open
             if (isDetailsOpen) {
