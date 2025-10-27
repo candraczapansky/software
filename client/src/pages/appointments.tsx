@@ -1,4 +1,5 @@
 import { useState, useEffect, Suspense, lazy, useMemo, useContext, useCallback } from "react";
+import { useCalendarViewControl } from "@/hooks/useCalendarViewControl";
 import { SidebarController } from "@/components/layout/sidebar";
 // import Header from "@/components/layout/header"; // Provided by MainLayout
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
@@ -70,15 +71,7 @@ const AppointmentsPage = () => {
     } catch {}
     return new Date();
   });
-  const [calendarView, setCalendarView] = useState<'day' | 'week' | 'month'>(() => {
-    try {
-      if (typeof window !== 'undefined') {
-        const v = localStorage.getItem('appointments.calendarView');
-        if (v === 'day' || v === 'week' || v === 'month') return v;
-      }
-    } catch {}
-    return 'day';
-  });
+  const [calendarView, setCalendarViewState] = useState<'day' | 'week' | 'month'>('day');
   const [isDetailsOpen, setIsDetailsOpen] = useState(false);
   const [detailsAppointmentId, setDetailsAppointmentId] = useState<number | null>(null);
   
@@ -103,6 +96,19 @@ const AppointmentsPage = () => {
       }
     } catch {}
   };
+
+  // Initialize calendar view control
+  const { availableViews, setCalendarView } = useCalendarViewControl({
+    selectedStaffFilter,
+    onViewChange: (view) => {
+      setCalendarViewState(view);
+      try {
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('appointments.calendarView', view);
+        }
+      } catch {}
+    }
+  });
   
   const [isScheduleDialogOpen, setIsScheduleDialogOpen] = useState(false);
   const [editingSchedule, setEditingSchedule] = useState<any | null>(null);
@@ -2093,6 +2099,7 @@ const AppointmentsPage = () => {
                         availableColor={availableColor}
                         confirmedColor={confirmedColor}
                         arrivedColor={arrivedColor}
+                        availableViews={availableViews}
                         events={(() => {
                           try {
                             // Read locally-marked overrides
