@@ -1,5 +1,6 @@
 import { useState, useEffect, Suspense, lazy, useMemo, useContext, useCallback } from "react";
 import { useCalendarViewControl } from "@/hooks/useCalendarViewControl";
+import { useAppointmentDialogs } from "@/hooks/useAppointmentDialogs";
 import { SidebarController } from "@/components/layout/sidebar";
 // import Header from "@/components/layout/header"; // Provided by MainLayout
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
@@ -51,11 +52,24 @@ const AppointmentsPage = () => {
   // Note: Calendar starts on daily view by default, showing all staff per location
   // Users can filter to specific staff if needed, but daily view is optimized for seeing all staff schedules
   // Staff are filtered by both date (for daily view) and location (for all views) - only staff with schedules at the selected location appear
-  const [isFormOpen, setIsFormOpen] = useState(false);
-  const [selectedAppointmentId, setSelectedAppointmentId] = useState<number | null>(null);
-  const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
-  const [checkoutAppointment, setCheckoutAppointment] = useState<any>(null);
-  const [checkoutAppointmentId, setCheckoutAppointmentId] = useState<number | null>(null);
+  // Dialog state management
+  const {
+    isFormOpen,
+    selectedAppointmentId,
+    isCheckoutOpen,
+    checkoutAppointment,
+    checkoutAppointmentId,
+    isDetailsOpen,
+    detailsAppointmentId,
+    openNewAppointmentForm,
+    openEditAppointmentForm,
+    closeAppointmentForm,
+    openCheckout,
+    closeCheckout,
+    openDetails,
+    closeDetails
+  } = useAppointmentDialogs();
+
   const [selectedDate, setSelectedDate] = useState<Date | undefined>(() => {
     try {
       if (typeof window !== 'undefined') {
@@ -72,9 +86,6 @@ const AppointmentsPage = () => {
     return new Date();
   });
   const [calendarView, setCalendarViewState] = useState<'day' | 'week' | 'month'>('day');
-  const [isDetailsOpen, setIsDetailsOpen] = useState(false);
-  const [detailsAppointmentId, setDetailsAppointmentId] = useState<number | null>(null);
-  
   // Initialize selectedStaffFilter from localStorage (same approach as selectedDate and calendarView)
   const [selectedStaffFilter, setSelectedStaffFilterState] = useState<string>(() => {
     try {
@@ -259,8 +270,7 @@ const AppointmentsPage = () => {
       
       if (paymentCompleteShowing || forceClose) {
         console.log('[AppointmentsPage] Payment/Force close detected, ensuring form is closed');
-        setIsFormOpen(false);
-        setSelectedAppointmentId(null);
+        closeAppointmentForm();
         
         // Clear flags
         if (paymentCompleteShowing) {
@@ -1025,8 +1035,7 @@ const AppointmentsPage = () => {
     }
   });
   const handleAddAppointment = () => {
-    setSelectedAppointmentId(null);
-    setIsFormOpen(true);
+    openNewAppointmentForm();
   };
 
   const handleAddBlock = () => {
@@ -1139,27 +1148,21 @@ const AppointmentsPage = () => {
     }
 
     // Fallback: create a new appointment (existing behavior)
-    setSelectedAppointmentId(null);
-    setIsFormOpen(true);
+    openNewAppointmentForm();
   };
 
   const handleAppointmentClick = async (appointmentId: number) => {
     // Fetch latest appointment details (to include add-ons) then open details
     try {
       const res = await apiRequest("GET", `/api/appointments/${appointmentId}`);
-      const full = await res.json();
-      // If addOns present, pass to details by setting the same id (details fetches again itself)
-      // We still show details; backend now returns addOns so details will render them.
+      await res.json(); // We still fetch to ensure data is up to date
     } catch {}
-    setDetailsAppointmentId(appointmentId);
-    setIsDetailsOpen(true);
+    openDetails(appointmentId);
   };
 
   const handleEditAppointment = (appointmentId: number) => {
-    setSelectedAppointmentId(appointmentId);
-    setIsFormOpen(true);
-    // Keep details dialog open when editing
-    // setIsDetailsOpen remains true
+    openEditAppointmentForm(appointmentId);
+    // Details dialog will close automatically via the hook
     
     // Store a flag that form is open from details
     queryClient.setQueryData(['appointmentFormOpenFromDetails'], true);
@@ -2298,12 +2301,11 @@ const AppointmentsPage = () => {
                             const schedule = eventData.resource;
                             
                             // Open appointment form with pre-selected staff and time
-                            setSelectedAppointmentId(null);
                             // Store the schedule info for the appointment form
                             setEditAvailabilityStaffId(resourceId);
                             setEditAvailabilityDate(start);
                             setEditAvailabilitySchedule(schedule);
-                            setIsFormOpen(true);
+                            openNewAppointmentForm();
                             return;
                           }
                           
@@ -2430,9 +2432,7 @@ const AppointmentsPage = () => {
                             onClick={async () => {
                               try {
                                 if (!ctxAppointment?.id) return;
-                                setCheckoutAppointment(ctxAppointment);
-                                setCheckoutAppointmentId(ctxAppointment.id);
-                                setIsCheckoutOpen(true);
+                                openCheckout(ctxAppointment, ctxAppointment.id);
                                 setCtxMenuOpen(false);
                               } catch {}
                             }}
@@ -2473,11 +2473,9 @@ const AppointmentsPage = () => {
         <AppointmentForm
           open={isFormOpen}
           onOpenChange={(open) => {
-            setIsFormOpen(open);
             if (!open) {
-              // When form closes, clear the selected appointment
-              setSelectedAppointmentId(null);
-              // Note: Keep details dialog open if it was open
+              closeAppointmentForm();
+              // Note: Details dialog will be handled by the hook
             }
           }}
           appointmentId={selectedAppointmentId}
@@ -2486,7 +2484,7 @@ const AppointmentsPage = () => {
             refetch();
             // If editing from details, keep details open
             if (isDetailsOpen) {
-              setIsFormOpen(false);
+              closeAppointmentForm();
             }
           }}
           appointments={appointments}
@@ -2505,18 +2503,16 @@ const AppointmentsPage = () => {
       <Suspense fallback={null}>
         <AppointmentDetails
           open={isDetailsOpen}
-          onOpenChange={setIsDetailsOpen}
+          onOpenChange={(open) => !open && closeDetails()}
           appointmentId={detailsAppointmentId}
           onEdit={handleEditAppointment}
           onDelete={handleDeleteAppointment}
           onPaymentStart={() => {
             console.log('[AppointmentsPage] onPaymentStart called, forcefully closing appointment form');
             // Force close the appointment form immediately
-            setIsFormOpen(false);
+            closeAppointmentForm();
             // Also set in queryClient for immediate effect
             queryClient.setQueryData(['forceCloseAppointmentForm'], true);
-            // Clear any pending form state
-            setSelectedAppointmentId(null);
             queryClient.setQueryData(['appointmentFormOpenFromDetails'], false);
           }}
         />
@@ -2926,9 +2922,7 @@ const AppointmentsPage = () => {
             isOpen={true}
             onClose={() => {
               // console.log("[AppointmentsPage] Closing checkout dialog and refreshing data");
-              setIsCheckoutOpen(false);
-              setCheckoutAppointment(null);
-              setCheckoutAppointmentId(null);
+              closeCheckout();
               // Refresh data after closing
               refetch();
             }}
