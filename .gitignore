@@ -1,0 +1,29 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gz
+
+# Environment files
+.env
+.env.local
+.env.backup
+.env.bak
+
+# Log files
+*.log
+logs/
+__pycache__/
+*/__pycache__/
+
+# Local directories
+.local/
+
+# Database backups
+backups/
+*.dump
+awscliv2.zip
+ngrok
+ngrok.tgz
+cloudflared

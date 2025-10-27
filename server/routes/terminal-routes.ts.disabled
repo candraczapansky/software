@@ -1,0 +1,588 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import { HelcimTerminalService } from '../services/helcim-terminal-service.js';
+import { HelcimApiClient } from '../services/helcim-api-client.js';
+import type { IStorage } from '../storage.js';
+import { TerminalConfigService } from '../services/terminal-config-service.js';
+import { log } from '../log.js';
+import { triggerAfterPayment } from '../automation-triggers.js';
+
+// Factory to create router with storage dependency
+export default function createTerminalRoutes(storage: IStorage) {
+  const router = Router();
+  const configService = new TerminalConfigService(storage);
+  const terminalService: any = (storage as any).__terminalService || new HelcimTerminalService(configService);
+  (storage as any).__terminalService = terminalService;
+  const helcimApiClient = new HelcimApiClient();
+
+  // Schema for terminal initialization
+  const InitializeTerminalSchema = z.object({
+    terminalId: z.string(),
+    locationId: z.string(),
+    deviceCode: z.string(),
+    apiToken: z.string(),
+  });
+
+  // Schema for payment request
+  const PaymentRequestSchema = z.object({
+    locationId: z.string(),
+    amount: z.number().positive(),
+    tipAmount: z.number().optional(),
+    reference: z.string().optional(),
+    description: z.string().optional(),
+  });
+
+  // Initialize a terminal for a location
+  router.post('/initialize', async (req, res) => {
+    try {
+      const data = InitializeTerminalSchema.parse(req.body);
+      const success = await terminalService.initializeTerminal({
+        terminalId: data.terminalId,
+        locationId: data.locationId,
+        deviceCode: data.deviceCode,
+        apiToken: data.apiToken,
+      });
+
+      if (success) {
+        res.json({ success: true, message: 'Terminal initialized successfully' });
+      } else {
+        res.status(500).json({ success: false, message: 'Failed to initialize terminal' });
+      }
+    } catch (error: any) {
+      console.error('❌ Error initializing terminal:', error);
+      res.status(400).json({ 
+        success: false, 
+        message: error.message || 'Invalid request data' 
+      });
+    }
+  });
+
+  // Start a payment on a terminal
+  router.post('/payment/start', async (req, res) => {
+    try {
+      const data = PaymentRequestSchema.parse(req.body);
+      let paymentId: number | undefined;
+      let invoiceNumber: string;
+
+      if ((data as any).appointmentId && storage) {
+        try {
+          const payment = await storage.createPayment({
+            appointmentId: (data as any).appointmentId,
+            clientId: (data as any).clientId,
+            amount: data.amount,
+            totalAmount: data.amount,
+            method: 'terminal',
+            status: 'pending',
+            type: 'appointment',
+            description: data.description || 'Terminal payment'
+          });
+          paymentId = payment.id;
+          invoiceNumber = `INV${String(paymentId).padStart(6, '0')}`;
+          
+          await storage.updatePayment(paymentId, {
+            notes: JSON.stringify({
+              invoiceNumber,
+              terminalPayment: true,
+              createdAt: new Date().toISOString()
+            })
+          });
+        } catch (error) {
+          console.warn('Could not pre-create payment record:', error);
+          invoiceNumber = String(Date.now()).slice(-10);
+        }
+      } else {
+        try {
+          const payment = await storage.createPayment({
+            clientId: (data as any).clientId || 1,
+            amount: data.amount,
+            totalAmount: data.amount,
+            method: 'terminal',
+            status: 'pending',
+            type: 'pos',
+            description: data.description || 'POS Terminal payment'
+          });
+          paymentId = payment.id;
+          invoiceNumber = String(Date.now()).slice(-10);
+          
+          await storage.updatePayment(paymentId, {
+            notes: JSON.stringify({
+              invoiceNumber,
+              terminalPayment: true,
+              posPayment: true,
+              createdAt: new Date().toISOString()
+            })
+          });
+        } catch (error) {
+          console.warn('Could not create POS payment record:', error);
+          invoiceNumber = String(Date.now()).slice(-10);
+        }
+      }
+
+      const totalAmountToCharge = data.amount + (data.tipAmount || 0);
+      const result = await terminalService.startPayment(
+        data.locationId,
+        totalAmountToCharge,
+        {
+          description: data.description,
+          invoiceNumber,
+          appointmentId: (data as any).appointmentId,
+          paymentId,
+          baseAmount: data.amount,
+          tipAmount: data.tipAmount || 0
+        }
+      );
+
+      const helcimTxId = (result as any).transactionId || (result as any).paymentId || (result as any).id || null;
+      
+      if (paymentId && helcimTxId && storage) {
+        try {
+          await storage.updatePayment(paymentId, {
+            helcimPaymentId: helcimTxId,
+            status: (result as any).status === 'completed' ? 'completed' : 'pending'
+          });
+        } catch (error) {
+          console.warn('Could not update payment with Helcim ID:', error);
+        }
+      }
+
+      if (terminalService && (terminalService as any).sessionStore) {
+        const sessionData = {
+          startedAt: Date.now(),
+          locationId: data.locationId,
+          deviceCode: (result as any).deviceCode || 'unknown',
+          totalAmount: totalAmountToCharge,
+          baseAmount: data.amount,
+          tipAmount: data.tipAmount || 0,
+          paymentId: paymentId,
+          appointmentId: (data as any).appointmentId,
+          invoiceNumber: invoiceNumber,
+          helcimTxId: helcimTxId
+        };
+        
+        if (paymentId) {
+          (terminalService as any).sessionStore.set(`payment_${paymentId}`, sessionData);
+        }
+        
+        (terminalService as any).sessionStore.set(invoiceNumber, sessionData);
+        
+        if (helcimTxId) {
+          (terminalService as any).sessionStore.set(String(helcimTxId), sessionData);
+        }
+      }
+
+      res.json({
+        success: true,
+        paymentId: invoiceNumber,
+        transactionId: helcimTxId,
+        invoiceNumber: invoiceNumber,
+        status: (result as any).status || 'pending'
+      });
+    } catch (error: any) {
+      console.error('❌ Error starting payment:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: error.message || 'Failed to start payment' 
+      });
+    }
+  });
+
+  // Check payment status
+  router.get('/payment/:locationId/:paymentId', async (req, res) => {
+    try {
+      const { locationId, paymentId } = req.params;
+      
+      try {
+        const g: any = (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__;
+        if (g && 
+            (g.transactionId === paymentId || g.invoiceNumber === paymentId) &&
+            (Date.now() - (g.updatedAt || 0)) <= 90 * 1000) {
+          if (g.status === 'failed') {
+            return res.json({
+              success: false,
+              status: 'failed',
+              message: 'Payment was declined or cancelled',
+              transactionId: g.transactionId || paymentId,
+            });
+          } else if (g.status === 'completed') {
+            return res.json({
+              success: true,
+              status: 'completed',
+              last4: g.last4,
+              transactionId: g.transactionId || paymentId,
+              amount: g.amount,
+              tipAmount: g.tipAmount,
+              baseAmount: g.baseAmount,
+            });
+          }
+        }
+      } catch {}
+
+      try {
+        delete (req as any).headers['if-none-match'];
+        delete (req as any).headers['if-modified-since'];
+      } catch {}
+
+      try {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.setHeader('Surrogate-Control', 'no-store');
+        try { res.removeHeader('ETag'); } catch {}
+        try { res.removeHeader('Last-Modified'); } catch {}
+      } catch {}
+
+      try {
+        const cached: any = (terminalService as any).checkWebhookCache?.(paymentId) || (terminalService as any).getCachedWebhookStatus?.(paymentId);
+        if (cached) {
+          if (cached.status !== 'completed' && cached.transactionId) {
+            try {
+              const refreshed = await terminalService.checkPaymentStatus(locationId, String(cached.transactionId));
+              const r = (refreshed as any) || {};
+              return res.json({
+                success: r.status === 'completed',
+                status: r.status || cached.status,
+                last4: r.last4 || cached.last4,
+                transactionId: r.transactionId || cached.transactionId,
+                amount: r.amount || cached.amount,
+                tipAmount: r.tipAmount || cached.tipAmount,
+                baseAmount: r.baseAmount || cached.baseAmount,
+              });
+            } catch {}
+          }
+          return res.json({
+            success: cached.status === 'completed',
+            status: cached.status,
+            last4: cached.last4,
+            transactionId: cached.transactionId || paymentId,
+            amount: cached.amount,
+            tipAmount: cached.tipAmount,
+            baseAmount: cached.baseAmount,
+          });
+        }
+      } catch {}
+
+      let status = await terminalService.checkPaymentStatus(locationId, paymentId);
+      let s = (status as any) || {};
+
+      if ((s.status === 'pending' || !s.status) && (s.transactionId || paymentId)) {
+        const txId = s.transactionId || paymentId;
+        if (txId && /^\d+$/.test(String(txId))) {
+          try {
+            const transactionDetails = await helcimApiClient.getTransactionDetails(String(txId));
+            
+            if (helcimApiClient.isTransactionApproved(transactionDetails)) {
+              s.status = 'completed';
+            } else if (helcimApiClient.isTransactionCancelled(transactionDetails)) {
+              s.status = 'cancelled';
+            } else {
+              s.status = 'failed';
+            }
+            
+            const sessionStore = (terminalService as any).sessionStore || new Map();
+            let tipAmount = 0;
+            let baseAmount = transactionDetails.amount;
+            
+            const session = sessionStore.get(paymentId) || sessionStore.get(txId);
+            
+            if (session?.baseAmount && transactionDetails.amount > session.baseAmount) {
+              baseAmount = session.baseAmount;
+              tipAmount = transactionDetails.amount - baseAmount;
+            } else if (session?.baseAmount) {
+              baseAmount = session.baseAmount;
+            }
+            
+            const webhookStore = (terminalService as any).webhookStore || new Map();
+            webhookStore.set(String(txId), {
+              status: s.status,
+              transactionId: txId,
+              amount: transactionDetails.amount,
+              baseAmount: baseAmount,
+              tipAmount: tipAmount,
+              updatedAt: Date.now()
+            });
+            
+            s.transactionId = txId;
+            s.amount = transactionDetails.amount;
+            s.baseAmount = baseAmount;
+            s.tipAmount = tipAmount;
+          } catch (error) {
+            console.error('❌ Failed to fetch from Helcim API:', error);
+          }
+        }
+      }
+
+      const responseData = {
+        success: s.status === 'completed',
+        status: s.status || 'pending',
+        message: s.message || 'Processing payment...',
+        last4: s.last4 || s.cardLast4 || undefined,
+        cardLast4: s.last4 || s.cardLast4 || undefined,
+        transactionId: s.transactionId || paymentId,
+        terminalId: s.terminalId || undefined,
+        amount: s.amount,
+        tipAmount: s.tipAmount,
+        baseAmount: s.baseAmount,
+      };
+
+      res.status(200).json(responseData);
+    } catch (error: any) {
+      console.error('❌ Error checking payment status:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: error.message || 'Failed to check payment status' 
+      });
+    }
+  });
+
+  // Location-agnostic alias: allow polling without providing locationId
+  router.get('/payment/:paymentId', async (req, res) => {
+    try {
+      const { paymentId } = req.params;
+      
+      try {
+        const g: any = (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__;
+        if (g && (Date.now() - (g.updatedAt || 0)) <= 90 * 1000) {
+          return res.json({
+            success: true,
+            status: 'completed',
+            last4: g.last4,
+            transactionId: g.transactionId || paymentId,
+          });
+        }
+      } catch {}
+
+      try {
+        delete (req as any).headers['if-none-match'];
+        delete (req as any).headers['if-modified-since'];
+      } catch {}
+
+      try {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.setHeader('Surrogate-Control', 'no-store');
+        try { res.removeHeader('ETag'); } catch {}
+        try { res.removeHeader('Last-Modified'); } catch {}
+      } catch {}
+
+      try {
+        const cached: any = (terminalService as any).checkWebhookCache?.(paymentId) || (terminalService as any).getCachedWebhookStatus?.(paymentId);
+        if (cached) {
+          return res.json({
+            success: cached.status === 'completed',
+            status: cached.status,
+            last4: cached.last4,
+            transactionId: cached.transactionId || paymentId,
+            amount: cached.amount,
+            tipAmount: cached.tipAmount,
+            baseAmount: cached.baseAmount,
+          });
+        }
+      } catch {}
+
+      let status = await terminalService.checkPaymentStatus('', paymentId);
+      let s = (status as any) || {};
+
+      if ((s.status === 'pending' || !s.status) && (s.transactionId || paymentId)) {
+        const txId = s.transactionId || paymentId;
+        if (txId && /^\d+$/.test(String(txId))) {
+          try {
+            const transactionDetails = await helcimApiClient.getTransactionDetails(String(txId));
+            
+            if (helcimApiClient.isTransactionApproved(transactionDetails)) {
+              s.status = 'completed';
+            } else if (helcimApiClient.isTransactionCancelled(transactionDetails)) {
+              s.status = 'cancelled';
+            } else {
+              s.status = 'failed';
+            }
+            
+            const sessionStore = (terminalService as any).sessionStore || new Map();
+            let tipAmount = 0;
+            let baseAmount = transactionDetails.amount;
+            
+            const session = sessionStore.get(paymentId) || sessionStore.get(txId);
+            
+            if (session?.baseAmount && transactionDetails.amount > session.baseAmount) {
+              baseAmount = session.baseAmount;
+              tipAmount = transactionDetails.amount - baseAmount;
+            } else if (session?.baseAmount) {
+              baseAmount = session.baseAmount;
+            }
+            
+            const webhookStore = (terminalService as any).webhookStore || new Map();
+            webhookStore.set(String(txId), {
+              status: s.status,
+              transactionId: txId,
+              amount: transactionDetails.amount,
+              baseAmount: baseAmount,
+              tipAmount: tipAmount,
+              updatedAt: Date.now()
+            });
+            
+            s.transactionId = txId;
+            s.amount = transactionDetails.amount;
+            s.baseAmount = baseAmount;
+            s.tipAmount = tipAmount;
+          } catch (error) {
+            console.error('❌ Failed to fetch from Helcim API:', error);
+          }
+        }
+      }
+
+      const responseData = {
+        success: s.status === 'completed',
+        status: s.status || 'pending',
+        message: s.message || 'Processing payment...',
+        last4: s.last4 || s.cardLast4 || undefined,
+        cardLast4: s.last4 || s.cardLast4 || undefined,
+        transactionId: s.transactionId || paymentId,
+        terminalId: s.terminalId || undefined,
+        amount: s.amount,
+        tipAmount: s.tipAmount,
+        baseAmount: s.baseAmount,
+      };
+
+      return res.status(200).json(responseData);
+    } catch (error: any) {
+      console.error('❌ Error checking payment status (no location):', error);
+      return res.status(500).json({ success: false, message: error.message || 'Failed to check payment status' });
+    }
+  });
+
+  // Webhook endpoint: handle payment status updates
+  router.post('/webhook', async (req: any, res: any) => {
+    try {
+      let payload: any = req.body || {};
+      if (typeof payload === 'string') {
+        try { payload = JSON.parse(payload); } catch {}
+      }
+      
+      const queryParams: any = req.query || {};
+      const queryInvoiceNumber = queryParams.invoiceNumber || queryParams.invoice || queryParams.reference;
+      
+      const txId = payload?.id;
+      const type = payload?.type;
+      
+      if (type === 'cardTransaction' && txId) {
+        let paymentStatus = 'completed';
+        
+        const statusFields = [
+          payload?.status,
+          payload?.approved,
+          payload?.transactionStatus,
+          payload?.response,
+          payload?.responseMessage,
+          payload?.error
+        ];
+        
+        const statusStr = statusFields.filter(s => s != null).map(s => String(s).toLowerCase()).join(' ');
+        if (statusStr.includes('declined') || 
+            statusStr.includes('failed') || 
+            statusStr.includes('cancelled') || 
+            statusStr.includes('error') ||
+            payload?.approved === false ||
+            payload?.approved === 'false' ||
+            payload?.approved === 0) {
+          paymentStatus = 'failed';
+        }
+        
+        if (txId && type === 'cardTransaction' && paymentStatus !== 'failed') {
+          try {
+            const transactionDetails = await helcimApiClient.getTransactionDetails(txId);
+            
+            if (helcimApiClient.isTransactionApproved(transactionDetails)) {
+              paymentStatus = 'completed';
+            } else if (helcimApiClient.isTransactionCancelled(transactionDetails)) {
+              paymentStatus = 'cancelled';
+            } else {
+              paymentStatus = 'failed';
+            }
+            
+            const webhookStore = (terminalService as any).webhookStore || new Map();
+            const sessionStore = (terminalService as any).sessionStore || new Map();
+            
+            const cacheData = {
+              status: paymentStatus,
+              transactionId: txId,
+              updatedAt: Date.now(),
+            };
+            
+            webhookStore.set(String(txId), cacheData);
+            
+            let invoiceNumber: string | null = queryInvoiceNumber || null;
+            
+            if (!invoiceNumber) {
+              const sessionByTxId = sessionStore.get(String(txId));
+              if (sessionByTxId && sessionByTxId.invoiceNumber) {
+                invoiceNumber = sessionByTxId.invoiceNumber;
+              }
+            }
+            
+            if (!invoiceNumber) {
+              const now = Date.now();
+              let newestSession: { key: string; session: any } | null = null;
+              sessionStore.forEach((session: any, key: string) => {
+                if (now - session.startedAt <= 5 * 60 * 1000) {
+                  if (!newestSession || session.startedAt > newestSession.session.startedAt) {
+                    newestSession = { key, session };
+                  }
+                }
+              });
+              
+              if (newestSession) {
+                const session = newestSession as { key: string; session: any };
+                invoiceNumber = session.session.invoiceNumber || session.key;
+              }
+            }
+            
+            if (invoiceNumber) {
+              webhookStore.set(String(invoiceNumber), cacheData);
+              
+              try {
+                (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__ = {
+                  ...cacheData,
+                  invoiceNumber: invoiceNumber
+                };
+              } catch {}
+            } else {
+              const now = Date.now();
+              sessionStore.forEach((session: any, key: string) => {
+                if (now - session.startedAt <= 60 * 1000) {
+                  webhookStore.set(key, cacheData);
+                }
+              });
+            }
+            
+            setImmediate(async () => {
+              try {
+                await sharedTerminalService.handleWebhook({
+                  id: txId,
+                  transactionId: txId,
+                  type: 'cardTransaction',
+                  status: paymentStatus,
+                  invoiceNumber: invoiceNumber,
+                  approved: payload?.approved,
+                  response: payload?.response,
+                  rawPayload: payload
+                });
+              } catch (err) {
+                console.error('⚠️ Secondary webhook processing failed:', err);
+              }
+            });
+          } catch (error) {
+            console.error('❌ Failed to fetch transaction details:', error);
+            paymentStatus = 'pending';
+          }
+        }
+      }
+      
+      return res.status(200).json({ received: true });
+    } catch (error: any) {
+      console.error('❌ Error in terminal webhook:', error);
+      return res.status(200).json({ received: true });
+    }
+  });
+
+  return router;
+}

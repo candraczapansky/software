@@ -1,0 +1,214 @@
+/* Button Icons */
+button svg:not([data-hamburger]) {
+  color: var(--text-primary) !important;
+  fill: currentColor !important;
+}
+
+[data-hamburger="true"] {
+  color: hsl(var(--primary)) !important;
+  fill: hsl(var(--primary)) !important;
+}
+
+/* Booking dialog desktop: ensure Cancel/Next action buttons are white for contrast */
+.booking-desktop-overlay .booking-actions button,
+.booking-desktop-overlay .booking-actions .btn,
+.booking-desktop-overlay .booking-actions [role="button"] {
+  color: #fff !important;
+}
+
+/* Booking dialog desktop: force all text/icons/placeholders to white for visibility */
+.booking-desktop-overlay,
+.booking-desktop-overlay .text-gray-900,
+.booking-desktop-overlay .text-foreground,
+.booking-desktop-overlay h1,
+.booking-desktop-overlay h2,
+.booking-desktop-overlay h3,
+.booking-desktop-overlay h4,
+.booking-desktop-overlay h5,
+.booking-desktop-overlay h6 {
+  color: #fff !important;
+}
+
+.booking-desktop-overlay .text-gray-500,
+.booking-desktop-overlay .dark\:text-gray-400,
+.booking-desktop-overlay .text-muted-foreground {
+  color: rgba(255, 255, 255, 0.85) !important;
+}
+
+.booking-desktop-overlay button,
+.booking-desktop-overlay .btn,
+.booking-desktop-overlay [role="button"] {
+  color: #fff !important;
+}
+
+.booking-desktop-overlay svg {
+  color: #fff !important;
+  fill: currentColor !important;
+}
+
+.booking-desktop-overlay ::placeholder {
+  color: rgba(255, 255, 255, 0.7) !important;
+}
+
+.booking-desktop-overlay .border-gray-700,
+.booking-desktop-overlay .dark\:border-gray-300,
+.booking-desktop-overlay .border-foreground {
+  border-color: rgba(255, 255, 255, 0.75) !important;
+}
+
+/* Profile Picture */
+.profile-circle {
+  @apply w-[120px] h-[120px] min-w-[120px] min-h-[120px] max-w-[120px] max-h-[120px] rounded-[60px] bg-cover bg-center bg-no-repeat border-[3px] border-gray-200 flex-shrink-0 box-border aspect-square overflow-hidden block relative;
+}
+
+/* Form Elements */
+.form-input {
+  @apply bg-input border border-input text-foreground transition-colors duration-200;
+}
+
+.form-input:focus {
+  @apply border-ring ring-2 ring-ring/20 outline-none;
+}
+
+.form-label {
+  @apply text-foreground font-medium;
+}
+
+.form-error {
+  @apply text-destructive text-sm;
+}
+
+.form-success {
+  @apply text-green-600 text-sm;
+}
+
+/* Status Indicators */
+.status-success {
+  @apply bg-green-100 text-green-800 border border-green-200;
+}
+
+.status-warning {
+  @apply bg-yellow-100 text-yellow-800 border border-yellow-200;
+}
+
+.status-info {
+  @apply bg-blue-100 text-blue-800 border border-blue-200;
+}
+
+/* Cards */
+.card-enhanced {
+  @apply bg-card border border-border rounded-lg shadow-sm transition-all duration-200;
+}
+
+.card-enhanced:hover {
+  @apply shadow-md -translate-y-0.5;
+}
+
+.stats-card {
+  @apply transition-all duration-200;
+}
+
+.stats-card:hover {
+  @apply shadow-lg -translate-y-1;
+}
+
+/* Tabs */
+[data-radix-tabs-trigger] {
+  @apply text-foreground;
+}
+
+[data-radix-tabs-trigger]:hover {
+  @apply text-foreground;
+}
+
+[data-radix-tabs-trigger][data-state="active"] {
+  @apply text-primary-foreground;
+}
+
+/* Booking dialog mobile hardening */
+@media (max-width: 640px) {
+  /* Mobile dialog default: safe full-width unless a component provides its own overlay class */
+  [data-radix-dialog-content]:not(.booking-mobile-overlay) {
+    left: 0 !important;
+    top: 0 !important;
+    transform: none !important;
+    width: 100vw !important;
+    max-width: 100vw !important;
+    margin: 0 !important;
+    padding-left: max(env(safe-area-inset-left), 8px) !important;
+    padding-right: max(env(safe-area-inset-right), 8px) !important;
+    box-sizing: border-box !important;
+  }
+  
+  /* Booking mobile overlay specific scrolling fix */
+  .booking-mobile-overlay {
+    -webkit-overflow-scrolling: touch !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+  }
+  
+  .booking-mobile-overlay form {
+    min-height: 100%;
+  }
+
+  /* Mobile booking overlay: force white text/icons for better contrast on colored backgrounds */
+  .booking-mobile-overlay,
+  .booking-mobile-overlay .text-gray-900,
+  .booking-mobile-overlay .text-foreground,
+  .booking-mobile-overlay h1,
+  .booking-mobile-overlay h2,
+  .booking-mobile-overlay h3,
+  .booking-mobile-overlay h4,
+  .booking-mobile-overlay h5,
+  .booking-mobile-overlay h6 {
+    color: #fff !important;
+  }
+
+  .booking-mobile-overlay .text-gray-500,
+  .booking-mobile-overlay .dark\:text-gray-400,
+  .booking-mobile-overlay .text-muted-foreground {
+    color: rgba(255, 255, 255, 0.85) !important;
+  }
+
+  .booking-mobile-overlay button,
+  .booking-mobile-overlay .btn,
+  .booking-mobile-overlay [role="button"] {
+    color: #fff !important;
+  }
+
+  .booking-mobile-overlay svg {
+    color: #fff !important;
+    fill: currentColor !important;
+  }
+
+  .booking-mobile-overlay ::placeholder {
+    color: rgba(255, 255, 255, 0.7) !important;
+  }
+
+  /* Light borders become white on colored overlays */
+  .booking-mobile-overlay .border-gray-700,
+  .booking-mobile-overlay .dark\:border-gray-300,
+  .booking-mobile-overlay .border-foreground {
+    border-color: rgba(255, 255, 255, 0.75) !important;
+  }
+}
+
+/* Email Editor */
+.email-template-editor {
+  @apply h-full w-full flex flex-col;
+}
+
+.email-template-editor > div,
+.email-template-editor iframe {
+  @apply h-full w-full flex-1 min-h-0;
+}
+
+[data-state="open"] .email-template-editor {
+  @apply h-full min-h-[500px];
+}
+
+#unlayer-container,
+.unlayer-container,
+[id*="unlayer"] {
+  @apply h-full w-full;
+}

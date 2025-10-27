@@ -1,0 +1,33 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Production optimizations
+    "sourceMap": false,
+    "removeComments": true,
+    "noEmitOnError": false,
+    "incremental": true,
+    "tsBuildInfoFile": ".tsbuildinfo",
+    
+    // Skip type checking for faster builds (rely on IDE for development)
+    "skipLibCheck": true,
+    "skipDefaultLibCheck": true,
+    
+    // Optimize module resolution
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true
+  },
+  "exclude": [
+    "node_modules",
+    "dist",
+    "scripts/test*",
+    "**/*.test.ts",
+    "**/*.spec.ts",
+    "**/*.test.tsx",
+    "**/*.spec.tsx",
+    "coverage",
+    ".vite",
+    "attached_assets"
+  ]
+}

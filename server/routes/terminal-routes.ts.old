@@ -1,0 +1,2077 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import { HelcimTerminalService } from '../services/helcim-terminal-service.js';
+import { HelcimApiClient } from '../services/helcim-api-client.js';
+import type { IStorage } from '../storage.js';
+import { TerminalConfigService } from '../services/terminal-config-service.js';
+import { log } from '../log.js';
+import { triggerAfterPayment } from '../automation-triggers.js';
+
+// Factory to create router with storage dependency
+export default function createTerminalRoutes(storage: IStorage) {
+  const router = Router();
+  const configService = new TerminalConfigService(storage);
+  const terminalService: any = (storage as any).__terminalService || new HelcimTerminalService(configService);
+  (storage as any).__terminalService = terminalService;
+  const helcimApiClient = new HelcimApiClient();
+
+  // Schema for terminal initialization
+  const InitializeTerminalSchema = z.object({
+    terminalId: z.string(),
+    locationId: z.string(),
+    deviceCode: z.string(),
+    apiToken: z.string(),
+  });
+
+// Schema for payment request
+const PaymentRequestSchema = z.object({
+  locationId: z.string(),
+  amount: z.number().positive(),
+  tipAmount: z.number().optional(),
+  reference: z.string().optional(),
+  description: z.string().optional(),
+});
+
+/**
+ * Initialize a terminal for a location
+ */
+  router.post('/initialize', async (req, res) => {
+    try {
+      try { console.log('🟢 POST /api/terminal/initialize', { body: req.body }); } catch {}
+      try { log('🟢 POST /api/terminal/initialize'); } catch {}
+      const data = InitializeTerminalSchema.parse(req.body);
+
+      const success = await terminalService.initializeTerminal({
+        terminalId: data.terminalId,
+        locationId: data.locationId,
+        deviceCode: data.deviceCode,
+        apiToken: data.apiToken,
+      });
+
+      if (success) {
+        res.json({ success: true, message: 'Terminal initialized successfully' });
+      } else {
+        res.status(500).json({ success: false, message: 'Failed to initialize terminal' });
+      }
+    } catch (error: any) {
+      console.error('❌ Error initializing terminal:', error);
+      res.status(400).json({ 
+        success: false, 
+        message: error.message || 'Invalid request data' 
+      });
+    }
+  });
+
+/**
+ * Start a payment on a terminal
+ */
+router.post('/payment/start', async (req, res) => {
+  try {
+    try { console.log('🟢 POST /api/terminal/payment/start', { body: req.body }); } catch {}
+    try { log('🟢 POST /api/terminal/payment/start'); } catch {}
+    const data = PaymentRequestSchema.parse(req.body);
+    
+    // Create payment record first to get payment ID for invoice number
+    let paymentId: number | undefined;
+    let invoiceNumber: string;
+    
+    if ((data as any).appointmentId && storage) {
+      try {
+        // Create a pending payment record
+        const payment = await storage.createPayment({
+          appointmentId: (data as any).appointmentId,
+          clientId: (data as any).clientId,
+          amount: data.amount,
+          totalAmount: data.amount, // Add required totalAmount
+          method: 'terminal',
+          status: 'pending',
+          type: 'appointment',
+          description: data.description || 'Terminal payment'
+        });
+        paymentId = payment.id;
+        invoiceNumber = `INV${String(paymentId).padStart(6, '0')}`;
+        console.log(`📝 Created payment ${paymentId} with invoice number ${invoiceNumber}`);
+        
+        // Store invoice number in notes so webhook can find it
+        await storage.updatePayment(paymentId, {
+          notes: JSON.stringify({
+            invoiceNumber,
+            terminalPayment: true,
+            createdAt: new Date().toISOString()
+          })
+        });
+      } catch (error) {
+        console.warn('Could not pre-create payment record:', error);
+        // Fallback to shorter invoice - Helcim has strict limits
+        // Use just numeric timestamp last 10 digits
+        invoiceNumber = String(Date.now()).slice(-10);
+      }
+    } else {
+      // Fallback for non-appointment payments - still create a payment record
+      try {
+        const payment = await storage.createPayment({
+          clientId: (data as any).clientId || 1, // Use provided clientId or default to 1 for POS
+          amount: data.amount,
+          totalAmount: data.amount,
+          method: 'terminal',
+          status: 'pending',
+          type: 'pos',
+          description: data.description || 'POS Terminal payment'
+        });
+        paymentId = payment.id;
+        // Use numeric invoice for Helcim - they don't like prefixes
+        invoiceNumber = String(Date.now()).slice(-10);
+        console.log(`📝 Created POS payment ${paymentId} with invoice number ${invoiceNumber}`);
+        
+        // Store invoice number in notes so webhook can find it
+        await storage.updatePayment(paymentId, {
+          notes: JSON.stringify({
+            invoiceNumber,
+            terminalPayment: true,
+            posPayment: true,
+            createdAt: new Date().toISOString()
+          })
+        });
+      } catch (error) {
+        console.warn('Could not create POS payment record:', error);
+        // Last resort fallback - use numeric only
+        invoiceNumber = String(Date.now()).slice(-10);
+      }
+    }
+    
+    // Pass the TOTAL amount to Helcim (service + tip)
+    // Store the base amount separately in the session for tip calculation later
+    const totalAmountToCharge = data.amount + (data.tipAmount || 0);
+    
+    const result = await terminalService.startPayment(
+      data.locationId,
+      totalAmountToCharge,  // Send total amount to Helcim
+      {
+        description: data.description,
+        invoiceNumber,
+        appointmentId: (data as any).appointmentId,
+        paymentId,
+        baseAmount: data.amount,  // Pass the service cost for session storage
+        tipAmount: data.tipAmount || 0  // Pass the tip amount for session storage
+      }
+    );
+
+    // Normalize response for client expectations
+    // Prefer real transactionId when available so polling matches webhook cache
+    const helcimTxId = (result as any).transactionId || (result as any).paymentId || (result as any).id || null;
+    
+    // Update payment record with Helcim transaction ID if we have one
+    if (paymentId && helcimTxId && storage) {
+      try {
+        await storage.updatePayment(paymentId, {
+          helcimPaymentId: helcimTxId,
+          status: (result as any).status === 'completed' ? 'completed' : 'pending'
+        });
+        console.log(`✅ Updated payment ${paymentId} with Helcim TX ${helcimTxId}`);
+      } catch (error) {
+        console.warn('Could not update payment with Helcim ID:', error);
+      }
+    }
+    
+      // CRITICAL: Store session by payment ID as well so webhook can find it
+      if (terminalService && (terminalService as any).sessionStore) {
+        // Store the base amount (service cost) and tip separately
+        // This allows proper tip calculation when Helcim returns only the total
+        const sessionData = {
+          startedAt: Date.now(),
+          locationId: data.locationId,
+          deviceCode: (result as any).deviceCode || 'unknown',
+          totalAmount: totalAmountToCharge,  // Total amount sent to Helcim
+          baseAmount: data.amount,  // Original service cost WITHOUT tip
+          tipAmount: data.tipAmount || 0,  // Original tip amount from client
+          paymentId: paymentId,
+          appointmentId: (data as any).appointmentId,
+          invoiceNumber: invoiceNumber,
+          helcimTxId: helcimTxId  // Store the Helcim transaction ID if we have it
+        };
+        
+        // Store by payment ID if we have one
+        if (paymentId) {
+          (terminalService as any).sessionStore.set(`payment_${paymentId}`, sessionData);
+          console.log(`💾 Stored session by payment ID: payment_${paymentId}`);
+        }
+        
+        // Store by invoice number - this is what we poll with
+        (terminalService as any).sessionStore.set(invoiceNumber, sessionData);
+        console.log(`💾 Stored session by invoice: ${invoiceNumber}`);
+        
+        // CRITICAL: Also store by Helcim transaction ID if we have it
+        // This allows webhook to find the session when it only has the txId
+        if (helcimTxId) {
+          (terminalService as any).sessionStore.set(String(helcimTxId), sessionData);
+          console.log(`💾 Stored session by Helcim txId: ${helcimTxId}`);
+        }
+      }
+    
+    res.json({
+      success: true,
+      paymentId: invoiceNumber, // Return invoice number as paymentId for polling
+      transactionId: helcimTxId,
+      invoiceNumber: invoiceNumber,
+      status: (result as any).status || 'pending'
+    });
+  } catch (error: any) {
+    console.error('❌ Error starting payment:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to start payment' 
+    });
+  }
+});
+
+/**
+ * Check payment status
+ */
+router.get('/payment/:locationId/:paymentId', async (req, res) => {
+  try {
+    const { locationId, paymentId } = req.params;
+    try { console.log('🟡 GET /api/terminal/payment/:locationId/:paymentId', { locationId, paymentId }); } catch {}
+    try { log('🟡 GET /api/terminal/payment/:locationId/:paymentId'); } catch {}
+    // CRITICAL FIX: Only return status if the webhook is for THIS specific payment
+    // Must verify the webhook matches this exact paymentId to prevent false completions
+    try {
+      const g: any = (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__;
+      if (g && 
+          (g.transactionId === paymentId || g.invoiceNumber === paymentId) &&
+          (Date.now() - (g.updatedAt || 0)) <= 90 * 1000) {
+        console.log(`📌 Found matching webhook for payment ${paymentId} with status: ${g.status}`);
+        
+        // Return the actual status from the webhook (could be completed or failed)
+        if (g.status === 'failed') {
+          return res.json({
+            success: false,
+            status: 'failed',
+            message: 'Payment was declined or cancelled',
+            transactionId: g.transactionId || paymentId,
+          });
+        } else if (g.status === 'completed') {
+          return res.json({
+            success: true,
+            status: 'completed',
+            last4: g.last4,
+            transactionId: g.transactionId || paymentId,
+            amount: g.amount,
+            tipAmount: g.tipAmount,
+            baseAmount: g.baseAmount,
+          });
+        }
+      }
+    } catch {}
+    // Force bypass of conditional requests to prevent 304 during active polling
+    try {
+      delete (req as any).headers['if-none-match'];
+      delete (req as any).headers['if-modified-since'];
+    } catch {}
+    // Avoid intermediate proxies/browser returning 304 by disabling caching for polling endpoint
+    try {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      res.setHeader('Surrogate-Control', 'no-store');
+      // Ensure conditional validators are not present
+      try { res.removeHeader('ETag'); } catch {}
+      try { res.removeHeader('Last-Modified'); } catch {}
+    } catch {}
+    
+    // Fast-path: webhook cache. If pending, attempt refresh via transactionId
+    try {
+      console.log('🔍 Checking webhook cache for paymentId:', paymentId);
+      const cached: any = (terminalService as any).checkWebhookCache?.(paymentId) || (terminalService as any).getCachedWebhookStatus?.(paymentId);
+      console.log('📦 Cache result:', cached ? { status: cached.status, transactionId: cached.transactionId } : 'NOT FOUND');
+      if (cached) {
+        if (cached.status !== 'completed' && cached.transactionId) {
+          try {
+            const refreshed = await terminalService.checkPaymentStatus(locationId, String(cached.transactionId));
+            const r = (refreshed as any) || {};
+            return res.json({
+              success: r.status === 'completed',
+              status: r.status || cached.status,
+              last4: r.last4 || cached.last4,
+              transactionId: r.transactionId || cached.transactionId,
+              amount: r.amount || cached.amount,
+              tipAmount: r.tipAmount || cached.tipAmount,
+              baseAmount: r.baseAmount || cached.baseAmount,
+            });
+          } catch {}
+        }
+        return res.json({
+          success: cached.status === 'completed',
+          status: cached.status,
+          last4: cached.last4,
+          transactionId: cached.transactionId || paymentId,
+          amount: cached.amount,
+          tipAmount: cached.tipAmount,
+          baseAmount: cached.baseAmount,
+        });
+      }
+    } catch {}
+
+    let status = await terminalService.checkPaymentStatus(locationId, paymentId);
+    try {
+      console.log('🔎 Terminal status result:', { 
+        locationId, 
+        paymentId, 
+        status: (status as any)?.status,
+        transactionId: (status as any)?.transactionId,
+        amount: (status as any)?.amount,
+        tipAmount: (status as any)?.tipAmount,
+        baseAmount: (status as any)?.baseAmount
+      });
+    } catch {}
+    // Normalize response with fallbacks
+    let s = (status as any) || {};
+
+    // CRITICAL: If still pending and we have a transactionId, fetch from Helcim API
+    if ((s.status === 'pending' || !s.status) && (s.transactionId || paymentId)) {
+      const txId = s.transactionId || paymentId;
+      // Only fetch if it looks like a real transaction ID (numeric)
+      if (txId && /^\d+$/.test(String(txId))) {
+        try {
+          console.log(`🔍 No webhook cache - fetching transaction ${txId} from Helcim API`);
+          const transactionDetails = await helcimApiClient.getTransactionDetails(String(txId));
+          
+          if (helcimApiClient.isTransactionApproved(transactionDetails)) {
+            s.status = 'completed';
+            console.log('✅ Transaction APPROVED per Helcim API');
+          } else if (helcimApiClient.isTransactionCancelled(transactionDetails)) {
+            s.status = 'cancelled';
+            console.log('❌ Transaction CANCELLED per Helcim API');
+          } else {
+            s.status = 'failed';
+            console.log('❌ Transaction FAILED per Helcim API');
+          }
+          
+          // Get session to calculate tip
+          const sessionStore = (terminalService as any).sessionStore || new Map();
+          let tipAmount = 0;
+          let baseAmount = transactionDetails.amount;
+          
+          // Debug: Log all session keys to see what's available
+          console.log('🔑 Session store keys:', Array.from(sessionStore.keys()).slice(-5));
+          
+          // Try to find session by paymentId or transactionId
+          const session = sessionStore.get(paymentId) || sessionStore.get(txId);
+          console.log('📋 Session lookup:', {
+            paymentId,
+            txId,
+            foundSession: !!session,
+            sessionData: session ? { baseAmount: session.baseAmount, tipAmount: session.tipAmount } : null
+          });
+          
+          if (session?.baseAmount && transactionDetails.amount > session.baseAmount) {
+            baseAmount = session.baseAmount;
+            tipAmount = transactionDetails.amount - baseAmount;
+            console.log(`💰 Calculated tip from session: base=$${baseAmount}, tip=$${tipAmount}, total=$${transactionDetails.amount}`);
+          } else if (session?.baseAmount) {
+            baseAmount = session.baseAmount;
+            console.log(`💵 Using base amount from session: $${baseAmount}`);
+          } else {
+            console.log('⚠️ No session found - cannot calculate tip');
+          }
+          
+          // Update cache with the actual status and amounts
+          const webhookStore = (terminalService as any).webhookStore || new Map();
+          webhookStore.set(String(txId), {
+            status: s.status,
+            transactionId: txId,
+            amount: transactionDetails.amount,
+            baseAmount: baseAmount,
+            tipAmount: tipAmount,
+            updatedAt: Date.now()
+          });
+          
+          s.transactionId = txId;
+          s.amount = transactionDetails.amount;
+          s.baseAmount = baseAmount;
+          s.tipAmount = tipAmount;
+        } catch (error) {
+          console.error('❌ Failed to fetch from Helcim API:', error);
+        }
+      }
+    }
+    
+    // REMOVED DANGEROUS FALLBACK LOGIC that was auto-completing based on ANY recent webhook
+    const responseData = {
+      success: s.status === 'completed',
+      status: s.status || 'pending',
+      message: s.message || 'Processing payment...',
+      last4: s.last4 || s.cardLast4 || undefined,
+      cardLast4: s.last4 || s.cardLast4 || undefined,
+      transactionId: s.transactionId || paymentId,
+      terminalId: s.terminalId || undefined,
+      amount: s.amount,
+      tipAmount: s.tipAmount,
+      baseAmount: s.baseAmount,
+    };
+    
+    console.log('📤 Sending payment status response:', {
+      paymentId,
+      locationId,
+      status: responseData.status,
+      amount: responseData.amount,
+      tipAmount: responseData.tipAmount,
+      baseAmount: responseData.baseAmount,
+      hasTip: (responseData.tipAmount && responseData.tipAmount > 0) ? 'YES' : 'NO'
+    });
+    
+    res.status(200).json(responseData);
+  } catch (error: any) {
+    console.error('❌ Error checking payment status:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to check payment status' 
+    });
+  }
+});
+
+// Location-agnostic alias: allow polling without providing locationId
+router.get('/payment/:paymentId', async (req, res) => {
+  try {
+    const { paymentId } = req.params;
+    try { console.log('🟡 GET /api/terminal/payment/:paymentId', { paymentId }); } catch {}
+    try { log('🟡 GET /api/terminal/payment/:paymentId'); } catch {}
+    // Minimal confirmation mode: honor any recent success-only webhook globally
+    try {
+      const g: any = (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__;
+      if (g && (Date.now() - (g.updatedAt || 0)) <= 90 * 1000) {
+        return res.json({
+          success: true,
+          status: 'completed',
+          last4: g.last4,
+          transactionId: g.transactionId || paymentId,
+        });
+      }
+    } catch {}
+    // Strict mode: no force/global acceptance.
+    // Bypass conditional requests to prevent 304 during active polling
+    try {
+      delete (req as any).headers['if-none-match'];
+      delete (req as any).headers['if-modified-since'];
+    } catch {}
+    try {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      res.setHeader('Surrogate-Control', 'no-store');
+      try { res.removeHeader('ETag'); } catch {}
+      try { res.removeHeader('Last-Modified'); } catch {}
+    } catch {}
+
+    // Fast-path: webhook cache
+    try {
+      const cached: any = (terminalService as any).checkWebhookCache?.(paymentId) || (terminalService as any).getCachedWebhookStatus?.(paymentId);
+      if (cached) {
+        return res.json({
+          success: cached.status === 'completed',
+          status: cached.status,
+          last4: cached.last4,
+          transactionId: cached.transactionId || paymentId,
+          amount: cached.amount,
+          tipAmount: cached.tipAmount,
+          baseAmount: cached.baseAmount,
+        });
+      }
+    } catch {}
+
+    // Fallback: check status without relying on location
+    let status = await terminalService.checkPaymentStatus('', paymentId);
+    let s = (status as any) || {};
+
+    // CRITICAL: If still pending and we have a transaction ID, fetch from Helcim API
+    if ((s.status === 'pending' || !s.status) && (s.transactionId || paymentId)) {
+      const txId = s.transactionId || paymentId;
+      // Only fetch if it looks like a real transaction ID (numeric)
+      if (txId && /^\d+$/.test(String(txId))) {
+        try {
+          console.log(`🔍 Fetching transaction ${txId} from Helcim API`);
+          const transactionDetails = await helcimApiClient.getTransactionDetails(String(txId));
+          
+          if (helcimApiClient.isTransactionApproved(transactionDetails)) {
+            s.status = 'completed';
+            console.log('✅ Transaction APPROVED per Helcim API');
+          } else if (helcimApiClient.isTransactionCancelled(transactionDetails)) {
+            s.status = 'cancelled';
+            console.log('❌ Transaction CANCELLED per Helcim API');
+          } else {
+            s.status = 'failed';
+            console.log('❌ Transaction FAILED per Helcim API');
+          }
+          
+          // Get session to calculate tip
+          const sessionStore = (terminalService as any).sessionStore || new Map();
+          let tipAmount = 0;
+          let baseAmount = transactionDetails.amount;
+          
+          // Debug: Log all session keys to see what's available
+          console.log('🔑 Session store keys:', Array.from(sessionStore.keys()).slice(-5));
+          
+          // Try to find session by paymentId or transactionId
+          const session = sessionStore.get(paymentId) || sessionStore.get(txId);
+          console.log('📋 Session lookup:', {
+            paymentId,
+            txId,
+            foundSession: !!session,
+            sessionData: session ? { baseAmount: session.baseAmount, tipAmount: session.tipAmount } : null
+          });
+          
+          if (session?.baseAmount && transactionDetails.amount > session.baseAmount) {
+            baseAmount = session.baseAmount;
+            tipAmount = transactionDetails.amount - baseAmount;
+            console.log(`💰 Calculated tip from session: base=$${baseAmount}, tip=$${tipAmount}, total=$${transactionDetails.amount}`);
+          } else if (session?.baseAmount) {
+            baseAmount = session.baseAmount;
+            console.log(`💵 Using base amount from session: $${baseAmount}`);
+          }
+          
+          // Update cache with the actual status and amounts
+          const webhookStore = (terminalService as any).webhookStore || new Map();
+          webhookStore.set(String(txId), {
+            status: s.status,
+            transactionId: txId,
+            amount: transactionDetails.amount,
+            baseAmount: baseAmount,
+            tipAmount: tipAmount,
+            updatedAt: Date.now()
+          });
+          
+          s.transactionId = txId;
+          s.amount = transactionDetails.amount;
+          s.baseAmount = baseAmount;
+          s.tipAmount = tipAmount;
+        } catch (error) {
+          console.error('❌ Failed to fetch from Helcim API:', error);
+        }
+      }
+    }
+    const responseData = {
+      success: s.status === 'completed',
+      status: s.status || 'pending',
+      message: s.message || 'Processing payment...',
+      last4: s.last4 || s.cardLast4 || undefined,
+      cardLast4: s.last4 || s.cardLast4 || undefined,
+      transactionId: s.transactionId || paymentId,
+      terminalId: s.terminalId || undefined,
+      amount: s.amount,
+      tipAmount: s.tipAmount,
+      baseAmount: s.baseAmount,
+    };
+    
+    console.log('📤 Sending payment status response (no location):', {
+      paymentId,
+      status: responseData.status,
+      amount: responseData.amount,
+      tipAmount: responseData.tipAmount,
+      baseAmount: responseData.baseAmount,
+      hasTip: (responseData.tipAmount && responseData.tipAmount > 0) ? 'YES' : 'NO'
+    });
+    
+    return res.status(200).json(responseData);
+  } catch (error: any) {
+    console.error('❌ Error checking payment status (no location):', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to check payment status' });
+  }
+});
+
+  // Backward-compat endpoints used by some client flows
+  router.post('/confirm-payment', async (req, res) => {
+    try {
+      const { transactionId, deviceCode } = req.body || {};
+      if (!transactionId || !deviceCode) {
+        return res.status(400).json({ success: false, message: 'transactionId and deviceCode are required' });
+      }
+
+      const config = await configService.getTerminalConfigByDeviceCode(deviceCode);
+      if (!config) {
+        return res.status(404).json({ success: false, message: 'Terminal configuration not found for device' });
+      }
+
+      const status = await terminalService.checkPaymentStatus(config.locationId, transactionId);
+      const normalized = {
+        success: status.status === 'completed',
+        status: status.status,
+        cardLast4: status.last4,
+        transactionId: status.transactionId,
+      };
+      return res.json(normalized);
+    } catch (error: any) {
+      console.error('❌ Error confirming payment:', error);
+      return res.status(500).json({ success: false, message: error.message || 'Failed to confirm payment' });
+    }
+  });
+
+  router.post('/complete-payment', async (req, res) => {
+    try {
+      try { console.log('🟢 POST /api/terminal/complete-payment', { body: req.body }); } catch {}
+      const { transactionId, appointmentId, paymentId } = req.body || {};
+      if (!transactionId) {
+        return res.status(400).json({ success: false, message: 'transactionId is required' });
+      }
+
+      // CRITICAL FIX: Check ACTUAL webhook status instead of assuming success!
+      const webhookStore = (terminalService as any).webhookStore || new Map();
+      const cachedStatus = webhookStore.get(String(transactionId));
+      
+      // Only mark as completed if webhook confirms success
+      const isCompleted = cachedStatus?.status === 'completed';
+      
+      if (!isCompleted) {
+        console.log('⚠️ Payment NOT completed - webhook status:', cachedStatus?.status || 'unknown');
+        return res.json({ 
+          success: false, 
+          status: cachedStatus?.status || 'pending',
+          message: cachedStatus?.status === 'cancelled' ? 'Payment was cancelled' : 
+                   cachedStatus?.status === 'failed' ? 'Payment declined' : 
+                   'Payment not yet confirmed'
+        });
+      }
+      
+      console.log('✅ Payment confirmed completed by webhook');
+
+      if (isCompleted) {
+        try {
+          // Mark payment as completed if provided
+          if (paymentId !== undefined && paymentId !== null) {
+            const numericPaymentId = typeof paymentId === 'string' ? parseInt(paymentId, 10) : paymentId;
+            if (!Number.isNaN(numericPaymentId)) {
+              await (storage as any).updatePayment(numericPaymentId, {
+                status: 'completed',
+                processedAt: new Date(),
+              });
+
+              // Attempt to create staff earnings for payroll
+              try {
+                const payment = await (storage as any).getPayment(numericPaymentId);
+                if (payment?.appointmentId) {
+                  const appt = await storage.getAppointment(payment.appointmentId);
+                  if (appt) {
+                    const service = await storage.getService(appt.serviceId);
+                    const staffMember = await storage.getStaff(appt.staffId);
+                    if (service && staffMember) {
+                      let earningsAmount = 0;
+                      let rateType = 'commission';
+                      let rateUsed = 0;
+                      let calculationDetails = '';
+                      switch (staffMember.commissionType) {
+                        case 'commission': {
+                          const commissionRate = staffMember.commissionRate || 0;
+                          earningsAmount = service.price * commissionRate;
+                          rateUsed = commissionRate;
+                          calculationDetails = JSON.stringify({ type: 'commission', servicePrice: service.price, commissionRate, earnings: earningsAmount });
+                          break;
+                        }
+                        case 'hourly': {
+                          const hourlyRate = staffMember.hourlyRate || 0;
+                          const serviceDuration = service.duration || 60;
+                          const hours = serviceDuration / 60;
+                          earningsAmount = hourlyRate * hours;
+                          rateType = 'hourly';
+                          rateUsed = hourlyRate;
+                          calculationDetails = JSON.stringify({ type: 'hourly', servicePrice: service.price, hourlyRate, serviceDuration, hours, earnings: earningsAmount });
+                          break;
+                        }
+                        case 'fixed': {
+                          const fixedRate = staffMember.fixedRate || 0;
+                          earningsAmount = fixedRate;
+                          rateType = 'fixed';
+                          rateUsed = fixedRate;
+                          calculationDetails = JSON.stringify({ type: 'fixed', servicePrice: service.price, fixedRate, earnings: earningsAmount });
+                          break;
+                        }
+                        case 'hourly_plus_commission': {
+                          const hourlyRate = staffMember.hourlyRate || 0;
+                          const commissionRate = staffMember.commissionRate || 0;
+                          const serviceDuration = service.duration || 60;
+                          const hours = serviceDuration / 60;
+                          const hourlyPortion = hourlyRate * hours;
+                          const commissionPortion = service.price * commissionRate;
+                          earningsAmount = hourlyPortion + commissionPortion;
+                          rateType = 'hourly_plus_commission';
+                          rateUsed = hourlyRate;
+                          calculationDetails = JSON.stringify({ type: 'hourly_plus_commission', servicePrice: service.price, hourlyRate, commissionRate, serviceDuration, hours, hourlyPortion, commissionPortion, earnings: earningsAmount });
+                          break;
+                        }
+                        default:
+                          earningsAmount = 0;
+                          calculationDetails = JSON.stringify({ type: 'unknown', servicePrice: service.price, earnings: 0 });
+                      }
+
+                      if (earningsAmount > 0) {
+                        await (storage as any).createStaffEarnings({
+                          staffId: appt.staffId,
+                          appointmentId: appt.id,
+                          serviceId: appt.serviceId,
+                          paymentId: numericPaymentId,
+                          earningsAmount,
+                          rateType,
+                          rateUsed,
+                          isCustomRate: false,
+                          servicePrice: service.price,
+                          calculationDetails,
+                          earningsDate: new Date(),
+                        });
+                      }
+                    }
+                  }
+                }
+              } catch {}
+            }
+          }
+
+          // Mark appointment as paid if provided
+          if (appointmentId !== undefined && appointmentId !== null) {
+            const numericAppointmentId = typeof appointmentId === 'string' ? parseInt(appointmentId, 10) : appointmentId;
+            if (!Number.isNaN(numericAppointmentId)) {
+              await storage.updateAppointment(numericAppointmentId, {
+                paymentStatus: 'paid',
+              } as any);
+              // Fire automation after payment
+              try {
+                const appt = await storage.getAppointment(numericAppointmentId);
+                if (appt) {
+                  await triggerAfterPayment(appt, storage);
+                }
+              } catch (e) {
+                try { console.error('⚠️ Failed to trigger after_payment automation (terminal complete)', e); } catch {}
+              }
+            }
+          }
+        } catch (updateError: any) {
+          // Log but do not fail the response if DB updates have issues
+          console.error('⚠️ Error updating payment/appointment after terminal completion:', updateError);
+        }
+
+        // Ensure subsequent polling returns completed by caching a synthetic webhook
+        try {
+          await (terminalService as any).handleWebhook({
+            id: String(transactionId),
+            transactionId: String(transactionId),
+            invoiceNumber: String(transactionId),
+            type: 'cardTransaction',
+            approved: true,
+            status: 'approved',
+          });
+        } catch {}
+      }
+
+      return res.json({ 
+        success: isCompleted, 
+        status: isCompleted ? 'completed' : 'pending',
+        transactionId,
+        paymentId: paymentId ?? null,
+        appointmentId: appointmentId ?? null,
+      });
+    } catch (error: any) {
+      console.error('❌ Error completing payment:', error);
+      return res.status(500).json({ success: false, message: error.message || 'Failed to complete payment' });
+    }
+  });
+
+  // Fallback: attempt to resolve and complete by invoice or transaction id
+  router.post('/complete-by-invoice', async (req, res) => {
+    try {
+      const { locationId, paymentId, appointmentId, dbPaymentId } = req.body || {};
+      if (!locationId || !paymentId) {
+        return res.status(400).json({ success: false, message: 'locationId and paymentId are required' });
+      }
+      // Try to resolve status by provided id
+      let status = await terminalService.checkPaymentStatus(String(locationId), String(paymentId));
+      // If we got a different concrete transactionId, try once more by that id
+      if (status?.transactionId && status.transactionId !== paymentId && status.status !== 'completed') {
+        try {
+          const s2 = await terminalService.checkPaymentStatus(String(locationId), String(status.transactionId));
+          if (s2) status = s2 as any;
+        } catch {}
+      }
+      const isCompleted = (status as any)?.status === 'completed';
+      // If completed, update DB similarly to complete-payment
+      if (isCompleted) {
+        try {
+          if (dbPaymentId !== undefined && dbPaymentId !== null) {
+            const numericPaymentId = typeof dbPaymentId === 'string' ? parseInt(dbPaymentId, 10) : dbPaymentId;
+            if (!Number.isNaN(numericPaymentId)) {
+              await (storage as any).updatePayment(numericPaymentId, {
+                status: 'completed',
+                processedAt: new Date(),
+              });
+            }
+          }
+          if (appointmentId !== undefined && appointmentId !== null) {
+            const numericAppointmentId = typeof appointmentId === 'string' ? parseInt(appointmentId, 10) : appointmentId;
+            if (!Number.isNaN(numericAppointmentId)) {
+              await storage.updateAppointment(numericAppointmentId, { paymentStatus: 'paid' } as any);
+              // Fire automation after payment
+              try {
+                const appt = await storage.getAppointment(numericAppointmentId);
+                if (appt) {
+                  await triggerAfterPayment(appt, storage);
+                }
+              } catch (e) {
+                try { console.error('⚠️ Failed to trigger after_payment automation (terminal complete-by-invoice)', e); } catch {}
+              }
+            }
+          }
+        } catch {}
+      }
+      return res.json({
+        success: isCompleted,
+        status: (status as any)?.status || 'pending',
+        transactionId: (status as any)?.transactionId || paymentId,
+      });
+    } catch (error: any) {
+      console.error('❌ Error completing by invoice:', error);
+      return res.status(500).json({ success: false, message: error.message || 'Failed to complete by invoice' });
+    }
+  });
+
+  // Helcim webhook endpoint: properly check payment status
+  router.post('/webhook', async (req, res) => {
+    try {
+      try { log('🟢 POST /api/terminal/webhook'); } catch {}
+      try {
+        console.log('📥 Terminal webhook received. Checking payment status...', {
+          headers: (req as any).headers,
+        });
+      } catch {}
+      
+      // Parse the payload
+      let payload: any = (req as any).body || {};
+      if (!payload || (Object.keys(payload).length === 0 && (req as any).rawBody)) {
+        try { payload = JSON.parse((req as any).rawBody); } catch {}
+      }
+      if (typeof payload === 'string') {
+        try { payload = JSON.parse(payload); } catch {}
+      }
+      let maybe: any = payload?.payload ?? payload?.data ?? payload?.event ?? payload;
+      if (typeof maybe === 'string') {
+        try { maybe = JSON.parse(maybe); } catch {}
+      }
+
+      // Extract invoice/reference from query params (Helcim may append ?invoiceNumber=...)
+      const queryParams: any = (req as any).query || {};
+      const queryInvoiceNumber = queryParams.invoiceNumber || queryParams.invoice || queryParams.reference || queryParams.ref || queryParams.inv;
+      if (queryInvoiceNumber) {
+        // Inject into payloads so downstream handling can correlate/caches correctly
+        payload.invoiceNumber = payload?.invoiceNumber || queryInvoiceNumber;
+        if (maybe && typeof maybe === 'object') {
+          maybe.invoiceNumber = maybe?.invoiceNumber || queryInvoiceNumber;
+        }
+      }
+      
+      // Extract transaction ID
+      let txId: string | undefined;
+      const candidate = maybe?.transactionId || maybe?.cardTransactionId || maybe?.id || maybe?.paymentId || payload?.id;
+      if (candidate) txId = String(candidate);
+      
+      // Determine payment status from webhook payload
+      let paymentStatus = 'pending';
+      const statusFields = [
+        payload?.status,
+        payload?.approved,
+        payload?.transactionStatus,
+        payload?.response,
+        maybe?.status,
+        maybe?.approved,
+        maybe?.transactionStatus,
+        maybe?.response
+      ];
+      
+      // Check for declined/cancelled/failed status
+      const statusStr = statusFields.filter(s => s != null).map(s => String(s).toLowerCase()).join(' ');
+      if (statusStr.includes('declined') || 
+          statusStr.includes('failed') || 
+          statusStr.includes('cancelled') || 
+          statusStr.includes('cancel') ||
+          statusStr.includes('voided') ||
+          statusStr.includes('refunded') ||
+          payload?.approved === false ||
+          payload?.approved === 'false' ||
+          payload?.approved === 0 ||
+          maybe?.approved === false ||
+          maybe?.approved === 'false' ||
+          maybe?.approved === 0) {
+        paymentStatus = 'failed';
+        console.log('❌ Payment declined/failed detected in terminal webhook');
+      } else if (payload?.approved === true || 
+                 payload?.approved === 'true' || 
+                 payload?.approved === 1 ||
+                 maybe?.approved === true ||
+                 maybe?.approved === 'true' ||
+                 maybe?.approved === 1 ||
+                 statusStr.includes('approved') ||
+                 statusStr.includes('completed') ||
+                 statusStr.includes('success')) {
+        paymentStatus = 'completed';
+        console.log('✅ Payment approved detected in terminal webhook');
+      } else {
+        // CRITICAL: Don't assume cardTransaction means success!
+        // We MUST fetch actual transaction details from Helcim API
+        const webhookType = maybe?.type || payload?.type;
+        if (webhookType === 'cardTransaction' && txId) {
+          console.log(`🔍 cardTransaction webhook - fetching ACTUAL status from Helcim API for txId: ${txId}`);
+          try {
+            const transactionDetails = await helcimApiClient.getTransactionDetails(txId);
+            
+            // Check ACTUAL transaction status from Helcim
+            if (helcimApiClient.isTransactionApproved(transactionDetails)) {
+              paymentStatus = 'completed';
+              console.log('✅ Transaction APPROVED based on Helcim API data');
+            } else if (helcimApiClient.isTransactionCancelled(transactionDetails)) {
+              paymentStatus = 'cancelled';
+              console.log('❌ Transaction CANCELLED based on Helcim API data');
+            } else {
+              paymentStatus = 'failed';
+              console.log('❌ Transaction DECLINED/FAILED based on Helcim API data');
+            }
+          } catch (error) {
+            console.error('❌ Failed to fetch transaction details from Helcim:', error);
+            // If we can't verify, keep as pending to prevent auto-completion
+            paymentStatus = 'pending';
+            console.log('⚠️ Cannot verify transaction - keeping as PENDING');
+          }
+        } else if (webhookType === 'terminalCancel') {
+          paymentStatus = 'cancelled';
+          console.log('❌ Terminal payment CANCELLED via terminalCancel webhook');
+        } else {
+          // For unknown types, keep as pending
+          paymentStatus = 'pending';
+          console.log('⚠️ Unknown webhook type - keeping as PENDING');
+          console.log('   Type:', webhookType || 'unknown');
+          console.log('   Approved:', payload?.approved, 'Status:', payload?.status);
+        }
+      }
+      
+      // Only record global marker if payment was successful AND we have the transaction ID
+      // This ensures we don't incorrectly mark other payments as complete
+      if (paymentStatus === 'completed' && txId) {
+        try {
+          (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__ = {
+            status: 'completed',
+            transactionId: txId,
+            invoiceNumber: (queryInvoiceNumber || txId), // Include both fields for compatibility
+            updatedAt: Date.now(),
+          };
+        } catch {}
+      } else if (paymentStatus === 'failed' && txId) {
+        // Store failed status for this specific transaction
+        try {
+          (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__ = {
+            status: 'failed',
+            transactionId: txId,
+            invoiceNumber: (queryInvoiceNumber || txId), // Include both fields for compatibility
+            updatedAt: Date.now(),
+          };
+        } catch {}
+      }
+      
+      // Attempt enrichment by invoking service (non-blocking)
+      if (txId) {
+        setImmediate(async () => {
+    try {
+      // CRITICAL: Also directly cache in webhookStore for immediate availability
+      const webhookStore = (terminalService as any).webhookStore;
+      const sessionStore = (terminalService as any).sessionStore;
+      
+      if (webhookStore) {
+        const cacheData = {
+          status: paymentStatus,
+          transactionId: txId,
+          updatedAt: Date.now(),
+        };
+        
+        // Cache by transaction ID
+        webhookStore.set(String(txId), cacheData);
+        console.log(`💾 Cached by txId: ${txId} -> ${paymentStatus}`);
+        
+        // Cache by invoice number if available
+        if (queryInvoiceNumber) {
+          webhookStore.set(String(queryInvoiceNumber), cacheData);
+          console.log(`💾 Cached by invoice: ${queryInvoiceNumber} -> ${paymentStatus}`);
+        } else if (sessionStore) {
+          // Try to find session by transaction ID
+          const sessionByTxId = sessionStore.get(String(txId));
+          if (sessionByTxId && sessionByTxId.invoiceNumber) {
+            webhookStore.set(String(sessionByTxId.invoiceNumber), cacheData);
+            console.log(`✅ Found session by txId! Cached by invoice: ${sessionByTxId.invoiceNumber} -> ${paymentStatus}`);
+          } else {
+            // Find most recent session as fallback
+            const now = Date.now();
+            let newestSession: { key: string; session: any } | null = null;
+            sessionStore.forEach((session: any, key: string) => {
+              if (now - session.startedAt <= 5 * 60 * 1000) {
+                if (!newestSession || session.startedAt > newestSession.session.startedAt) {
+                  newestSession = { key, session };
+                }
+              }
+            });
+            
+            if (newestSession) {
+              const session = newestSession as { key: string; session: any };
+              const invoiceNumber = session.session.invoiceNumber || session.key;
+              webhookStore.set(String(invoiceNumber), cacheData);
+              console.log(`💾 Cached by recent session invoice: ${invoiceNumber} -> ${paymentStatus}`);
+            }
+          }
+        }
+        
+        // Also call handleWebhook for additional processing
+        await (terminalService as any).handleWebhook({ 
+          transactionId: txId, 
+          type: 'cardTransaction',
+          status: paymentStatus,
+          approved: payload?.approved || maybe?.approved,
+          response: payload?.response || maybe?.response,
+          invoiceNumber: (queryInvoiceNumber || payload?.invoiceNumber || maybe?.invoiceNumber),
+          rawPayload: payload
+        });
+      }
+    } catch (err) {
+      try { console.error('❌ Terminal webhook enrichment failed:', err); } catch {}
+    }
+  });
+} else {
+  // No id provided; associate with the most recent active session so polling can complete
+  try {
+    const snapshot = (terminalService as any).getDebugSnapshot?.();
+    const sessions = Array.isArray(snapshot?.sessions) ? snapshot.sessions : [];
+    if (sessions.length > 0) {
+      const recent = sessions
+        .filter((s: any) => (Date.now() - (s.startedAt || 0)) <= 10 * 60 * 1000)
+        .sort((a: any, b: any) => (b.startedAt || 0) - (a.startedAt || 0))[0];
+      if (recent?.key) {
+        setImmediate(async () => {
+          try {
+            await (terminalService as any).handleWebhook({ invoiceNumber: String(recent.key), type: 'cardTransaction', approved: true });
+          } catch (err) {
+            try { console.error('❌ Terminal webhook session-association failed:', err); } catch {}
+          }
+        });
+      }
+    }
+  } catch {}
+      }
+      // Respond immediately; no further processing
+      try { return res.json({ received: true }); } catch {}
+      return;
+    } catch (error: any) {
+      try { console.error('❌ Error handling terminal webhook (success-only):', error); } catch {}
+      return res.status(200).json({ received: true });
+    }
+  });
+
+  // Simple health endpoint to verify webhook path is live
+  router.get('/webhook', async (_req, res) => {
+    try {
+      res.json({ status: 'ok' });
+    } catch (e: any) {
+      res.status(500).json({ status: 'error', message: e?.message || 'unknown' });
+    }
+  });
+
+  // Lightweight debug endpoint to inspect recent terminal sessions and webhooks
+  router.get('/debug/snapshot', async (req, res) => {
+    try {
+      try {
+        res.setHeader('Cache-Control', 'no-store');
+      } catch {}
+      const snapshot = (terminalService as any).getDebugSnapshot?.() || { sessions: [], webhooks: [] };
+      return res.json(snapshot);
+    } catch (e: any) {
+      return res.status(500).json({ error: e?.message || 'Failed to load debug snapshot' });
+    }
+  });
+
+/**
+ * Cancel a payment
+ */
+router.post('/payment/:locationId/:paymentId/cancel', async (req, res) => {
+  try {
+    const { locationId, paymentId } = req.params;
+    
+    const result = await terminalService.cancelPayment(locationId, paymentId);
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    console.error('❌ Error canceling payment:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to cancel payment' 
+    });
+  }
+});
+
+/**
+ * Get terminal status
+ */
+router.get('/status/:locationId', async (req, res) => {
+  try {
+    const { locationId } = req.params;
+    try { console.log('🟢 GET /api/terminal/status/:locationId', { locationId }); } catch {}
+    try { log('🟢 GET /api/terminal/status/:locationId'); } catch {}
+    // Return configured=true if we have a saved terminal config for this location.
+    const config = await configService.getTerminalConfig(locationId);
+    if (!config) {
+      return res.status(404).json({ success: false, message: 'No terminal configured for this location' });
+    }
+    return res.json({
+      success: true,
+      status: 'configured',
+      terminalId: config.terminalId,
+      deviceCode: config.deviceCode,
+    });
+  } catch (error: any) {
+    console.error('❌ Error getting terminal status:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to get terminal status' 
+    });
+  }
+});
+
+/**
+ * Debug endpoint to clear webhook cache (temporary for testing)
+ */
+router.post('/clear-cache', (req, res) => {
+  try {
+    // Clear the global marker
+    delete (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__;
+    
+    // Clear webhook store
+    const webhookStore = (terminalService as any).webhookStore;
+    if (webhookStore) {
+      webhookStore.clear();
+    }
+    
+    // Clear session store
+    const sessionStore = (terminalService as any).sessionStore;
+    if (sessionStore) {
+      sessionStore.clear();
+    }
+    
+    console.log('🧹 Cleared all webhook and session caches');
+    return res.json({ success: true, message: 'All caches cleared' });
+  } catch (error: any) {
+    console.error('❌ Error clearing caches:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Complete POS terminal payment (no appointment)
+ */
+router.post('/complete-pos', async (req, res) => {
+  try {
+    const { cardLast4, totalAmount, tipAmount, baseAmount, transactionId } = req.body;
+    
+    console.log('💳 Completing POS terminal payment:', { 
+      totalAmount, 
+      tipAmount, 
+      baseAmount,
+      transactionId 
+    });
+
+    // Get storage instance
+    const storage = req.app.get('storage');
+    if (!storage) {
+      throw new Error('Storage not available');
+    }
+
+    // Create a payment record for POS sale
+    const payment = await storage.createPayment({
+      clientId: 1, // Default client for walk-in POS sales
+      amount: baseAmount || totalAmount,
+      tipAmount: tipAmount || 0,
+      totalAmount: totalAmount || baseAmount,
+      method: 'terminal',
+      status: 'completed',
+      type: 'pos_payment',
+      description: 'POS Terminal Sale',
+      helcimPaymentId: transactionId,
+      processedAt: new Date(),
+      notes: cardLast4 ? `Terminal payment - Card ending in ${cardLast4}` : 'Terminal payment completed'
+    });
+
+    // Create sales history record for reports
+    const salesData = {
+      transactionType: 'pos_sale',
+      transactionDate: new Date(),
+      paymentId: payment.id,
+      totalAmount: totalAmount || baseAmount,
+      paymentMethod: 'terminal',
+      paymentStatus: 'completed',
+      clientId: null,
+      clientName: null,
+      staffId: null,
+      staffName: null,
+      appointmentId: null,
+      serviceIds: null,
+      serviceNames: null,
+      serviceTotalAmount: null,
+      productIds: null,
+      productNames: null,
+      productQuantities: null,
+      productUnitPrices: null,
+      productTotalAmount: baseAmount || (totalAmount && tipAmount ? totalAmount - tipAmount : totalAmount),
+      membershipId: null,
+      membershipName: null,
+      membershipDuration: null,
+      taxAmount: 0,
+      tipAmount: tipAmount || 0,
+      discountAmount: 0,
+      businessDate: new Date(),
+      dayOfWeek: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][new Date().getDay()],
+      monthYear: `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`,
+      quarter: `${new Date().getFullYear()}-Q${Math.ceil((new Date().getMonth() + 1) / 3)}`,
+      helcimPaymentId: transactionId,
+      createdBy: null,
+      notes: 'POS Terminal Sale'
+    };
+
+    // Try to create sales history record
+    try {
+      await storage.createSalesHistory(salesData);
+      console.log('📊 Sales history record created for POS terminal payment');
+    } catch (e) {
+      console.log('Sales history creation skipped:', e);
+    }
+
+    return res.json({ 
+      success: true, 
+      payment,
+      message: 'POS payment completed successfully' 
+    });
+  } catch (error: any) {
+    console.error('❌ Error completing POS terminal payment:', error);
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to complete payment' 
+    });
+  }
+});
+
+/**
+ * Fix stuck terminal payment using transaction ID from webhook
+ * This endpoint is called when webhook is received to update the payment
+ */
+router.post('/fix-payment/:transactionId', async (req, res) => {
+  try {
+    const { transactionId } = req.params;
+    const { appointmentId, tipAmount, totalAmount, cardLast4, status = 'completed' } = req.body;
+    
+    console.log('🔧 Fixing terminal payment with webhook data:', { 
+      transactionId,
+      appointmentId, 
+      tipAmount,
+      totalAmount,
+      status
+    });
+
+    // Get storage instance
+    const storage = req.app.get('storage');
+    if (!storage) {
+      throw new Error('Storage not available');
+    }
+
+    // Find the payment by transaction ID or appointment ID
+    let payment = null;
+    let paymentToUpdate = null;
+    
+    // First try to find by Helcim transaction ID
+    const allPayments = await storage.getAllPayments();
+    payment = allPayments.find((p: any) => 
+      p.helcimPaymentId === transactionId || 
+      p.helcimPaymentId === parseInt(transactionId)
+    );
+    
+    // If not found by transaction ID and we have appointment ID, try that
+    if (!payment && appointmentId) {
+      const appointmentPayments = allPayments.filter((p: any) => 
+        p.appointmentId === parseInt(appointmentId) && 
+        p.status === 'pending'
+      );
+      if (appointmentPayments.length > 0) {
+        // Use the most recent pending payment
+        payment = appointmentPayments[appointmentPayments.length - 1];
+        console.log(`📌 Found payment by appointment ID: ${payment.id}`);
+      }
+    }
+    
+    // If still not found, look for recent pending terminal payments
+    if (!payment) {
+      const recentPendingPayments = allPayments.filter((p: any) => {
+        const isRecent = p.createdAt && (Date.now() - new Date(p.createdAt).getTime() < 10 * 60 * 1000);
+        const isPending = p.status === 'pending';
+        const isTerminal = p.method === 'terminal';
+        return isRecent && isPending && isTerminal;
+      });
+      
+      if (recentPendingPayments.length > 0) {
+        payment = recentPendingPayments[0];
+        console.log(`📌 Found recent pending terminal payment: ${payment.id}`);
+      }
+    }
+    
+    if (!payment) {
+      console.error(`❌ No payment found for transaction ${transactionId}`);
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Payment not found' 
+      });
+    }
+    
+    // Calculate amounts
+    const baseAmount = totalAmount && tipAmount ? totalAmount - tipAmount : (payment.amount || totalAmount);
+    const finalTipAmount = tipAmount || 0;
+    const finalTotalAmount = totalAmount || (baseAmount + finalTipAmount);
+    
+    console.log('💰 Payment amounts:', {
+      baseAmount,
+      tipAmount: finalTipAmount,
+      totalAmount: finalTotalAmount
+    });
+    
+    // Update payment with terminal details
+    const updatedPayment = await storage.updatePayment(payment.id, {
+      status: status,
+      helcimPaymentId: transactionId,
+      tipAmount: finalTipAmount,
+      totalAmount: finalTotalAmount,
+      amount: baseAmount,
+      processedAt: new Date(),
+      notes: JSON.stringify({
+        ...(payment.notes ? JSON.parse(payment.notes) : {}),
+        helcimTransactionId: transactionId,
+        cardLast4: cardLast4 || null,
+        terminalPayment: true,
+        verified: true,
+        fixedByWebhook: true,
+        processedAt: new Date().toISOString()
+      })
+    });
+    
+    console.log(`✅ Updated payment ${payment.id} with transaction ${transactionId}`);
+    
+    // Update appointment if we have one
+    const finalAppointmentId = appointmentId || payment.appointmentId;
+    if (finalAppointmentId && status === 'completed') {
+      // Check if this is part of a split payment by getting all payments for this appointment
+      const allPayments = await storage.getAllPayments();
+      const appointmentPayments = allPayments.filter((p: any) => p.appointmentId === parseInt(finalAppointmentId));
+      const totalPaid = appointmentPayments.reduce((sum: number, p: any) => {
+        if (p.status === 'completed') {
+          return sum + (p.totalAmount || p.amount || 0);
+        }
+        return sum;
+      }, 0);
+
+      // Get the appointment to check its total amount
+      const appointment = await storage.getAppointment(parseInt(finalAppointmentId));
+      if (appointment) {
+        const appointmentTotal = appointment.totalAmount || 0;
+        const paymentStatus = totalPaid >= appointmentTotal ? 'paid' : 'partial';
+        
+        await storage.updateAppointment(parseInt(finalAppointmentId), {
+          paymentStatus: paymentStatus
+        });
+        console.log(`✅ Updated appointment ${finalAppointmentId} payment status to ${paymentStatus} (paid: ${totalPaid}, total: ${appointmentTotal})`);
+      }
+    } else if (finalAppointmentId && status !== 'completed') {
+      console.log(`⚠️ Payment failed for appointment ${finalAppointmentId}, not updating status`);
+      }
+      
+      // Create sales history record
+      try {
+        const appointment = await storage.getAppointment(parseInt(finalAppointmentId));
+        if (appointment) {
+          let staffInfo = null;
+          let clientInfo = null;
+          let serviceInfo = null;
+          
+          if (appointment.staffId) {
+            try {
+              const staffData = await storage.getStaff(appointment.staffId);
+              if (staffData && staffData.userId) {
+                const staffUser = await storage.getUser(staffData.userId);
+                if (staffUser) {
+                  staffInfo = { id: staffData.id, user: staffUser };
+                }
+              }
+            } catch (e) {}
+          }
+          
+          if (appointment.clientId) {
+            try {
+              clientInfo = await storage.getUser(appointment.clientId);
+            } catch (e) {}
+          }
+          
+          if (appointment.serviceId) {
+            try {
+              serviceInfo = await storage.getService(appointment.serviceId);
+            } catch (e) {}
+          }
+          
+          const now = new Date();
+          const salesHistoryData = {
+            transactionType: 'appointment',
+            transactionDate: now,
+            paymentId: updatedPayment.id,
+            totalAmount: finalTotalAmount,
+            paymentMethod: 'terminal',
+            paymentStatus: status,
+            clientId: clientInfo?.id || null,
+            clientName: clientInfo ? `${clientInfo.firstName || ''} ${clientInfo.lastName || ''}`.trim() : null,
+            clientEmail: clientInfo?.email || null,
+            clientPhone: clientInfo?.phone || null,
+            staffId: staffInfo?.id || appointment.staffId || null,
+            staffName: staffInfo?.user ? `${staffInfo.user.firstName || ''} ${staffInfo.user.lastName || ''}`.trim() : null,
+            appointmentId: parseInt(finalAppointmentId),
+            serviceIds: serviceInfo ? JSON.stringify([serviceInfo.id]) : null,
+            serviceNames: serviceInfo ? JSON.stringify([serviceInfo.name]) : null,
+            serviceTotalAmount: baseAmount,
+            businessDate: now.toISOString().split('T')[0],
+            dayOfWeek: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][now.getDay()],
+            monthYear: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`,
+            quarter: `${now.getFullYear()}-Q${Math.ceil((now.getMonth() + 1) / 3)}`,
+            helcimPaymentId: transactionId,
+            taxAmount: 0,
+            tipAmount: finalTipAmount,
+            discountAmount: 0,
+            createdBy: null,
+            notes: cardLast4 ? `Terminal payment - Card ending in ${cardLast4}` : 'Terminal payment completed'
+          };
+          
+          await storage.createSalesHistory(salesHistoryData);
+          console.log('📊 Sales history created with tip amount:', finalTipAmount);
+        }
+      } catch (e) {
+        console.error('❌ Error creating sales history:', e);
+      }
+    }
+    
+    // Update the webhook cache to mark as completed
+    try {
+      const webhookStore = (terminalService as any).webhookStore || new Map();
+      const cacheData = {
+        status: status,
+        transactionId,
+        last4: cardLast4,
+        amount: finalTotalAmount,
+        tipAmount: finalTipAmount,
+        baseAmount: baseAmount,
+        updatedAt: Date.now()
+      };
+      
+      // CRITICAL: Cache by transaction ID
+      webhookStore.set(transactionId, cacheData);
+      console.log(`💾 Cached by transaction ID: ${transactionId}`);
+      
+      // CRITICAL: Also cache by invoice number so polling can find it
+      let invoiceNumber = null;
+      try {
+        const notes = payment.notes ? JSON.parse(payment.notes) : {};
+        invoiceNumber = notes.invoiceNumber;
+        if (invoiceNumber) {
+          webhookStore.set(invoiceNumber, cacheData);
+          console.log(`💾 Cached by invoice number: ${invoiceNumber}`);
+        }
+      } catch (e) {}
+      
+      // If payment has an ID, also cache by payment ID (in case it's used as reference)
+      if (payment.id) {
+        const paymentIdKey = `INV${String(payment.id).padStart(6, '0')}`;
+        webhookStore.set(paymentIdKey, cacheData);
+        console.log(`💾 Cached by payment ID key: ${paymentIdKey}`);
+      }
+      
+      // Also set the global marker for this specific payment
+      (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__ = {
+        status: status,
+        transactionId: transactionId,
+        invoiceNumber: invoiceNumber,
+        last4: cardLast4,
+        amount: finalTotalAmount,
+        tipAmount: finalTipAmount,
+        baseAmount: baseAmount,
+        updatedAt: Date.now()
+      };
+      
+      console.log('💾 Updated webhook cache with completed payment under multiple keys');
+    } catch (e) {
+      console.error('⚠️ Could not update webhook cache:', e);
+    }
+    
+    res.json({ 
+      success: true,
+      message: 'Payment fixed successfully',
+      paymentId: payment.id,
+      transactionId: transactionId,
+      status: status,
+      tipAmount: finalTipAmount,
+      totalAmount: finalTotalAmount
+    });
+    
+  } catch (error: any) {
+    console.error('❌ Error fixing payment:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to fix payment' 
+    });
+  }
+});
+
+/**
+ * Complete terminal payment and sync with calendar
+ */
+router.post('/complete/:appointmentId/:paymentId', async (req, res) => {
+  try {
+    const { appointmentId, paymentId } = req.params;
+    const { cardLast4, totalAmount, tipAmount, baseAmount, transactionId } = req.body;
+    
+    console.log('💳 Completing terminal payment:', { 
+      appointmentId, 
+      paymentId, 
+      totalAmount, 
+      tipAmount, 
+      baseAmount,
+      transactionId 
+    });
+
+    // Get storage instance
+    const storage = req.app.get('storage');
+    if (!storage) {
+      throw new Error('Storage not available');
+    }
+
+    // Update payment with terminal details - ALWAYS store the Helcim transaction ID
+    // IMPORTANT: Preserve the service cost in the 'amount' field
+    const updatedPayment = await storage.updatePayment(parseInt(paymentId), {
+      status: 'completed',
+      helcimPaymentId: transactionId || paymentId, // Always store the Helcim ID
+      amount: baseAmount || (totalAmount - (tipAmount || 0)),  // Service cost WITHOUT tip
+      tipAmount: tipAmount || 0,
+      totalAmount: totalAmount || baseAmount,
+      processedAt: new Date(),
+      notes: JSON.stringify({
+        helcimTransactionId: transactionId,
+        invoiceNumber: `INV${String(paymentId).padStart(6, '0')}`,
+        cardLast4: cardLast4 || null,
+        terminalPayment: true,
+        verified: true,
+        processedAt: new Date().toISOString()
+      })
+    });
+
+    // Update appointment payment status
+    await storage.updateAppointment(parseInt(appointmentId), {
+      paymentStatus: 'paid',
+      totalAmount: totalAmount || baseAmount
+    });
+
+    // Import the createSalesHistoryRecord function to properly record the sale
+    // This needs to be imported at the top of the file, but for now we'll create the record properly
+    const appointment = await storage.getAppointment(parseInt(appointmentId));
+    
+    // Declare variables outside the if block so they're accessible later
+    let staffInfo = null;
+    let clientInfo = null;
+    let serviceInfo = null;
+    
+    if (appointment && updatedPayment) {
+      try {
+        // Get staff and client info for the sales record
+        
+        if (appointment.staffId) {
+          try {
+            const staffData = await storage.getStaff(appointment.staffId);
+            if (staffData && staffData.userId) {
+              const staffUser = await storage.getUser(staffData.userId);
+              if (staffUser) {
+                staffInfo = { id: staffData.id, user: staffUser };
+              }
+            }
+          } catch (e) {
+            console.log('Error getting staff info:', e);
+          }
+        }
+        
+        if (appointment.clientId) {
+          try {
+            clientInfo = await storage.getUser(appointment.clientId);
+          } catch (e) {
+            console.log('Error getting client info:', e);
+          }
+        }
+        
+        if (appointment.serviceId) {
+          try {
+            serviceInfo = await storage.getService(appointment.serviceId);
+          } catch (e) {
+            console.log('Error getting service info:', e);
+          }
+        }
+        
+        const now = new Date();
+        const salesHistoryData = {
+          transactionType: 'appointment',
+          transactionDate: now,
+          paymentId: updatedPayment.id,
+          totalAmount: totalAmount || baseAmount || 0,
+          paymentMethod: 'terminal',
+          paymentStatus: 'completed',
+          
+          // Client information
+          clientId: clientInfo?.id || null,
+          clientName: clientInfo ? `${clientInfo.firstName || ''} ${clientInfo.lastName || ''}`.trim() : null,
+          clientEmail: clientInfo?.email || null,
+          clientPhone: clientInfo?.phone || null,
+          
+          // Staff information
+          staffId: staffInfo?.id || appointment.staffId || null,
+          staffName: staffInfo?.user ? `${staffInfo.user.firstName || ''} ${staffInfo.user.lastName || ''}`.trim() : null,
+          
+          // Appointment and service information
+          appointmentId: parseInt(appointmentId),
+          serviceIds: serviceInfo ? JSON.stringify([serviceInfo.id]) : null,
+          serviceNames: serviceInfo ? JSON.stringify([serviceInfo.name]) : null,
+          serviceTotalAmount: baseAmount || (totalAmount && tipAmount ? totalAmount - tipAmount : totalAmount),
+          
+          // Business date info
+          businessDate: now.toISOString().split('T')[0],
+          dayOfWeek: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][now.getDay()],
+          monthYear: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`,
+          quarter: `${now.getFullYear()}-Q${Math.ceil((now.getMonth() + 1) / 3)}`,
+          
+          // External tracking
+          helcimPaymentId: transactionId || null,
+          
+          // Tax and fees - CRITICALLY IMPORTANT FOR TIPS
+          taxAmount: 0,
+          tipAmount: tipAmount || 0,
+          discountAmount: 0,
+          
+          // Audit trail
+          createdBy: null,
+          notes: cardLast4 ? `Terminal payment - Card ending in ${cardLast4}` : 'Terminal payment completed'
+        };
+        
+        await storage.createSalesHistory(salesHistoryData);
+        console.log('📊 Sales history record created with tip:', { appointmentId, tipAmount });
+      } catch (e) {
+        console.error('❌ Error creating sales history:', e);
+      }
+      
+      // Create staff earnings record with tips for payroll
+      try {
+        if (staffInfo && serviceInfo) {
+          const staffMember = await storage.getStaff(staffInfo.id);
+          
+          if (staffMember) {
+            // Calculate staff earnings (include tips)
+            let earningsAmount = 0;
+            let rateType = 'commission';
+            let rateUsed = 0;
+            let calculationDetails = '';
+            
+            switch (staffMember.commissionType) {
+              case 'commission': {
+                const commissionRate = staffMember.commissionRate || 0;
+                const commissionOnService = serviceInfo.price * commissionRate;
+                // Add 100% of tips to earnings
+                earningsAmount = commissionOnService + (tipAmount || 0);
+                rateUsed = commissionRate;
+                calculationDetails = JSON.stringify({
+                  type: 'commission',
+                  servicePrice: serviceInfo.price,
+                  commissionRate: commissionRate,
+                  commissionEarnings: commissionOnService,
+                  tipAmount: tipAmount || 0,
+                  totalEarnings: earningsAmount
+                });
+                break;
+              }
+              case 'hourly': {
+                const hourlyRate = staffMember.hourlyRate || 0;
+                const serviceDuration = serviceInfo.duration || 60;
+                const hours = serviceDuration / 60;
+                const hourlyEarnings = hourlyRate * hours;
+                // Add 100% of tips to earnings
+                earningsAmount = hourlyEarnings + (tipAmount || 0);
+                rateType = 'hourly';
+                rateUsed = hourlyRate;
+                calculationDetails = JSON.stringify({
+                  type: 'hourly',
+                  servicePrice: serviceInfo.price,
+                  hourlyRate: hourlyRate,
+                  serviceDuration: serviceDuration,
+                  hours: hours,
+                  hourlyEarnings: hourlyEarnings,
+                  tipAmount: tipAmount || 0,
+                  totalEarnings: earningsAmount
+                });
+                break;
+              }
+              case 'fixed': {
+                const fixedRate = staffMember.fixedRate || 0;
+                // Add 100% of tips to earnings
+                earningsAmount = fixedRate + (tipAmount || 0);
+                rateType = 'fixed';
+                rateUsed = fixedRate;
+                calculationDetails = JSON.stringify({
+                  type: 'fixed',
+                  servicePrice: serviceInfo.price,
+                  fixedRate: fixedRate,
+                  fixedEarnings: fixedRate,
+                  tipAmount: tipAmount || 0,
+                  totalEarnings: earningsAmount
+                });
+                break;
+              }
+              case 'hourly_plus_commission': {
+                const hourlyRate = staffMember.hourlyRate || 0;
+                const commissionRate = staffMember.commissionRate || 0;
+                const serviceDuration = serviceInfo.duration || 60;
+                const hours = serviceDuration / 60;
+                const hourlyPortion = hourlyRate * hours;
+                const commissionPortion = serviceInfo.price * commissionRate;
+                const baseEarnings = hourlyPortion + commissionPortion;
+                // Add 100% of tips to earnings
+                earningsAmount = baseEarnings + (tipAmount || 0);
+                rateType = 'hourly_plus_commission';
+                rateUsed = hourlyRate;
+                calculationDetails = JSON.stringify({
+                  type: 'hourly_plus_commission',
+                  servicePrice: serviceInfo.price,
+                  hourlyRate: hourlyRate,
+                  commissionRate: commissionRate,
+                  serviceDuration: serviceDuration,
+                  hours: hours,
+                  hourlyPortion: hourlyPortion,
+                  commissionPortion: commissionPortion,
+                  baseEarnings: baseEarnings,
+                  tipAmount: tipAmount || 0,
+                  totalEarnings: earningsAmount
+                });
+                break;
+              }
+              default:
+                earningsAmount = tipAmount || 0; // At least include tips even if commission type unknown
+                calculationDetails = JSON.stringify({
+                  type: 'unknown',
+                  servicePrice: serviceInfo.price,
+                  tipAmount: tipAmount || 0,
+                  totalEarnings: earningsAmount
+                });
+            }
+            
+            // Create staff earnings record
+            if (earningsAmount > 0) {
+              await storage.createStaffEarnings({
+                staffId: staffInfo.id,
+                appointmentId: parseInt(appointmentId),
+                serviceId: appointment.serviceId,
+                paymentId: updatedPayment.id,
+                earningsAmount: earningsAmount,
+                rateType: rateType,
+                rateUsed: rateUsed,
+                isCustomRate: false,
+                servicePrice: serviceInfo.price,
+                calculationDetails: calculationDetails,
+                earningsDate: new Date()
+              });
+              
+              console.log('💰 Staff earnings created with tip:', { 
+                staffId: staffInfo.id,
+                earningsAmount,
+                tipAmount: tipAmount || 0
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.error('❌ Error creating staff earnings:', e);
+        // Don't fail the payment confirmation if earnings creation fails
+      }
+    }
+
+    return res.json({ 
+      success: true, 
+      payment: updatedPayment,
+      message: 'Payment completed and synced with calendar' 
+    });
+  } catch (error: any) {
+    console.error('❌ Error completing terminal payment:', error);
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Failed to complete payment' 
+    });
+  }
+});
+
+  // Webhook endpoint (without "helcim" in the path)
+  // This handles webhooks sent by Helcim when payments complete
+  router.post('/webhook', async (req: any, res: any) => {
+    try {
+      console.log('\n🚨🚨🚨 TERMINAL WEBHOOK RECEIVED 🚨🚨🚨');
+      console.log('URL:', req.url);
+      console.log('Query:', req.query);
+      console.log('Body:', JSON.stringify(req.body, null, 2));
+      console.log('🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨\n');
+      
+      log('🌐 POST /api/terminal/webhook');
+      console.log('📥 Terminal webhook received:', {
+        headers: req.headers,
+        body: req.body,
+        path: req.path,
+      });
+      
+      // Get the shared terminal service instance that has the webhook handler
+      const sharedTerminalService = (storage as any).__terminalService;
+      if (!sharedTerminalService) {
+        console.error('❌ Terminal service not initialized');
+        return res.status(200).json({ received: true }); // Still return 200 to not trigger retries
+      }
+      
+      // Parse the webhook payload
+      let payload: any = req.body || {};
+      if (typeof payload === 'string') {
+        try { payload = JSON.parse(payload); } catch {}
+      }
+      
+      // Extract invoice/reference from query params
+      const queryParams: any = req.query || {};
+      const queryInvoiceNumber = queryParams.invoiceNumber || queryParams.invoice || queryParams.reference;
+      
+      console.log('🔍 Query invoice number:', queryInvoiceNumber);
+      
+      // Helcim sends minimal webhook: {"id":"TRANSACTION_ID", "type":"cardTransaction"}
+      const txId = payload?.id;
+      const type = payload?.type;
+      
+      console.log('🎯 Processing webhook:', { id: txId, type, queryInvoiceNumber });
+      
+      // Process webhook based on type
+      if (type === 'cardTransaction' && txId) {
+        // Default to completed for cardTransaction webhooks
+        let paymentStatus = 'completed';
+        
+        // Check for failure indicators
+        const statusFields = [
+          payload?.status,
+          payload?.approved,
+          payload?.transactionStatus,
+          payload?.response,
+          payload?.responseMessage,
+          payload?.error
+        ];
+        
+        const statusStr = statusFields.filter(s => s != null).map(s => String(s).toLowerCase()).join(' ');
+        if (statusStr.includes('declined') || 
+            statusStr.includes('failed') || 
+            statusStr.includes('cancelled') || 
+            statusStr.includes('error') ||
+            payload?.approved === false ||
+            payload?.approved === 'false' ||
+            payload?.approved === 0) {
+          paymentStatus = 'failed';
+          console.log('❌ Payment declined/failed detected in webhook');
+        } else {
+          console.log('🔍 Processing cardTransaction webhook - need to verify with Helcim API');
+        }
+        
+        // CRITICAL: Fetch actual transaction details from Helcim API
+        if (txId && type === 'cardTransaction' && paymentStatus !== 'failed') {
+          console.log(`🔍 Fetching full transaction details for ID: ${txId}`);
+          try {
+            const transactionDetails = await helcimApiClient.getTransactionDetails(txId);
+            
+            // Determine ACTUAL payment status from the transaction details
+            if (helcimApiClient.isTransactionApproved(transactionDetails)) {
+              paymentStatus = 'completed';
+              console.log('✅ Transaction APPROVED based on actual Helcim data');
+            } else if (helcimApiClient.isTransactionCancelled(transactionDetails)) {
+              paymentStatus = 'cancelled';
+              console.log('❌ Transaction CANCELLED based on actual Helcim data');
+            } else {
+              paymentStatus = 'failed';
+              console.log('❌ Transaction DECLINED/FAILED based on actual Helcim data');
+            }
+            
+            // Get actual amounts and details from transaction
+            const actualTotalAmount = transactionDetails.totalAmount || transactionDetails.amount || 0;
+            const actualInvoiceNumber = transactionDetails.invoiceNumber || queryInvoiceNumber;
+            const actualCardLast4 = transactionDetails.cardLast4;
+            
+            // Update cache data with actual amounts
+            if (actualTotalAmount) {
+              cacheData.amount = actualTotalAmount;
+            }
+            if (actualCardLast4) {
+              cacheData.cardLast4 = actualCardLast4;
+            }
+            
+            // Try to determine tip amount from our stored session
+            const sessionStore = sharedTerminalService.sessionStore || new Map();
+            const sessionData = sessionStore.get(actualInvoiceNumber) || sessionStore.get(txId);
+            if (sessionData?.baseAmount && actualTotalAmount > sessionData.baseAmount) {
+              const actualTipAmount = actualTotalAmount - sessionData.baseAmount;
+              cacheData.tipAmount = actualTipAmount;
+              cacheData.baseAmount = sessionData.baseAmount;
+              console.log(`💰 Calculated tip from session: base=$${sessionData.baseAmount}, tip=$${actualTipAmount}, total=$${actualTotalAmount}`);
+            }
+            
+          } catch (error) {
+            console.error('❌ Failed to fetch transaction details:', error);
+            // If we can't verify, keep as pending to prevent auto-completion
+            paymentStatus = 'pending';
+            console.log('⚠️ Cannot verify transaction - keeping as PENDING');
+          }
+        }
+        
+        // CRITICAL: Cache webhook SYNCHRONOUSLY before responding
+        // This ensures polling can find the result immediately
+        const webhookStore = sharedTerminalService.webhookStore || new Map();
+        const sessionStore = sharedTerminalService.sessionStore || new Map();
+        
+        const cacheData = {
+          status: paymentStatus,
+          transactionId: txId,
+          updatedAt: Date.now(),
+        };
+        
+        try {
+          // Always cache by transaction ID
+          webhookStore.set(String(txId), cacheData);
+          console.log(`💾 Cached by txId: ${txId} -> ${paymentStatus}`);
+          
+          // Try to find the invoice number to cache by
+          let invoiceNumber: string | null = queryInvoiceNumber || null;
+          
+          if (!invoiceNumber) {
+            // Check if we have a session stored by this exact txId
+            const sessionByTxId = sessionStore.get(String(txId));
+            if (sessionByTxId && sessionByTxId.invoiceNumber) {
+              invoiceNumber = sessionByTxId.invoiceNumber;
+              console.log(`✅ Found session by txId! Invoice: ${invoiceNumber}`);
+            }
+          }
+          
+          if (!invoiceNumber) {
+            // Find the most recent session as fallback
+            const now = Date.now();
+            let newestSession: { key: string; session: any } | null = null;
+            sessionStore.forEach((session: any, key: string) => {
+              // Only consider sessions from last 5 minutes
+              if (now - session.startedAt <= 5 * 60 * 1000) {
+                if (!newestSession || session.startedAt > newestSession.session.startedAt) {
+                  newestSession = { key, session };
+                }
+              }
+            });
+            
+            if (newestSession) {
+              const session = newestSession as { key: string; session: any };
+              invoiceNumber = session.session.invoiceNumber || session.key;
+              console.log(`📌 Using newest session invoice: ${invoiceNumber} (${Math.round((now - session.session.startedAt) / 1000)}s old)`);
+            }
+          }
+          
+          // Cache by invoice number if we found one
+          if (invoiceNumber) {
+            webhookStore.set(String(invoiceNumber), cacheData);
+            console.log(`✅✅ CACHED BY INVOICE NUMBER: ${invoiceNumber} -> ${paymentStatus}`);
+            
+            // Also update the global marker for this specific payment
+            try {
+              (globalThis as any).__HEL_WEBHOOK_LAST_COMPLETED__ = {
+                ...cacheData,
+                invoiceNumber: invoiceNumber
+              };
+            } catch {}
+          } else {
+            console.log('⚠️ WARNING: Could not determine invoice number for webhook!');
+            // Last resort: cache by all recent session keys
+            const now = Date.now();
+            sessionStore.forEach((session: any, key: string) => {
+              if (now - session.startedAt <= 60 * 1000) { // Very recent sessions (1 minute)
+                webhookStore.set(key, cacheData);
+                console.log(`🔄 Emergency cache by session key: ${key}`);
+              }
+            });
+          }
+          
+          // Also handle the webhook through the service (for database updates, etc.)
+          // But do this asynchronously since caching is already done
+          setImmediate(async () => {
+            try {
+              await sharedTerminalService.handleWebhook({
+                id: txId,
+                transactionId: txId,
+                type: 'cardTransaction',
+                status: paymentStatus,
+                invoiceNumber: invoiceNumber,
+                approved: payload?.approved,
+                response: payload?.response,
+                rawPayload: payload
+              });
+              console.log(`📝 Database/additional processing complete for ${txId}`);
+            } catch (err) {
+              console.error('⚠️ Secondary webhook processing failed (cache already updated):', err);
+            }
+          });
+        } finally {
+          // Always proceed to the next condition
+          if (type === 'terminalCancel' || type === 'terminalDecline' || type === 'declined') {
+            const cancelStatus = type === 'declined' || type === 'terminalDecline' ? 'failed' : 'cancelled';
+            
+            // Cache cancellation/decline synchronously
+            const webhookStore = sharedTerminalService.webhookStore || new Map();
+            const sessionStore = sharedTerminalService.sessionStore || new Map();
+            
+            const cacheData = {
+              status: cancelStatus,
+              transactionId: txId,
+              updatedAt: Date.now(),
+            };
+            
+            // Cache by transaction ID
+            webhookStore.set(String(txId), cacheData);
+            console.log(`💾 Cached ${type} by txId: ${txId} -> ${cancelStatus}`);
+            
+            // Find and cache by invoice number
+            const sessionByTxId = sessionStore.get(String(txId));
+            if (sessionByTxId && sessionByTxId.invoiceNumber) {
+              webhookStore.set(String(sessionByTxId.invoiceNumber), cacheData);
+              console.log(`✅ Cached ${type} by invoice: ${sessionByTxId.invoiceNumber}`);
+            }
+            
+            setImmediate(async () => {
+              try {
+                await sharedTerminalService.handleWebhook({
+                  id: txId,
+                  transactionId: txId,
+                  type: type,
+                  status: cancelStatus,
+                  rawPayload: payload
+                });
+              } catch (err) {
+                console.error(`⚠️ ${type} secondary processing failed (cache already updated):`, err);
+              }
+            });
+          }
+        }
+      }
+      
+      // Always return 200 OK to acknowledge receipt
+      return res.status(200).json({ received: true });
+    } catch (error: any) {
+      console.error('❌ Error in terminal webhook:', error);
+      return res.status(200).json({ received: true });
+    }
+  });
+
+  return router;
+}

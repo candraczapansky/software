@@ -1,0 +1,62 @@
+# Multi-stage build for optimized deployment
+
+# Stage 1: Dependencies
+FROM node:18-alpine AS deps
+RUN apk add --no-cache python3 make g++
+WORKDIR /app
+
+# Copy only package files for better caching
+COPY package*.json ./
+# Install dependencies with cache mount
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --only=production --prefer-offline
+
+# Stage 2: Build dependencies (including dev dependencies)
+FROM node:18-alpine AS build-deps
+RUN apk add --no-cache python3 make g++
+WORKDIR /app
+
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --prefer-offline
+
+# Stage 3: Build the application
+FROM build-deps AS builder
+WORKDIR /app
+
+# Copy source code
+COPY . .
+
+# Build with optimizations
+ENV NODE_ENV=production
+RUN npm run build
+
+# Stage 4: Production image
+FROM node:18-alpine AS production
+RUN apk add --no-cache tini
+WORKDIR /app
+
+# Copy production dependencies from deps stage
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy built application from builder stage
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server ./server
+COPY --from=builder /app/shared ./shared
+COPY --from=builder /app/package*.json ./
+
+# Add tsx for production runtime (required for TypeScript)
+RUN npm install tsx --no-save
+
+# Use tini for proper signal handling
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# Expose port
+EXPOSE 3002
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3002/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+
+# Run the application
+CMD ["npm", "start"]
