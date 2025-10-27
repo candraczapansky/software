@@ -256,10 +256,20 @@ const AppointmentsPage = () => {
       endDate.setDate(0);
     }
     
-    return {
-      startDate: startDate.toISOString().split('T')[0],
-      endDate: endDate.toISOString().split('T')[0]
+    // Format dates as YYYY-MM-DD
+    const formatDate = (date: Date) => {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
     };
+
+    const result = {
+      startDate: formatDate(startDate),
+      endDate: formatDate(endDate)
+    };
+    console.log('Date range for appointments:', result);
+    return result;
   }, [calendarView, selectedDate]);
 
   // Monitor for payment completion to ensure appointment form is closed
@@ -295,16 +305,19 @@ const AppointmentsPage = () => {
     queryKey: ['/api/appointments', selectedLocation?.id, calendarView, selectedDate?.toISOString()],
     queryFn: async () => {
       const { startDate, endDate } = getDateRangeForView();
+      console.log('Fetching appointments for date range:', { startDate, endDate });
+      
       const params = new URLSearchParams({
         startDate,
         endDate,
         ...(selectedLocation?.id && { locationId: selectedLocation.id.toString() })
       });
       const url = `/api/appointments?${params}`;
-      // // console.log("[AppointmentsPage] 🔄 Fetching appointments from:", url);
+      console.log("[AppointmentsPage] 🔄 Fetching appointments from:", url);
+      
       const response = await apiRequest("GET", url);
       const data = await response.json();
-      // // console.log("[AppointmentsPage] ✅ Received appointments:", data.length, "appointments for date range");
+      console.log("[AppointmentsPage] ✅ Received appointments:", data);
       return data;
     },
     // Allow refetching to ensure we have latest data
@@ -2125,11 +2138,13 @@ const AppointmentsPage = () => {
                               }
                             } catch {}
 
+                            console.log('Creating calendar events from appointments:', filteredAppointments);
                             const appointmentEvents = filteredAppointments?.map((apt: any) => {
                               if (!apt || !apt.startTime) {
                                 console.warn('Invalid appointment data:', apt);
                                 return null;
                               }
+                              console.log('Processing appointment for calendar:', apt);
 
                               try {
                                 const client = users?.find((u: any) => u.id === apt.clientId);
