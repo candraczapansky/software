@@ -48,6 +48,15 @@ const SchedulePage = () => {
   // Fetch staff for display
   const { data: allStaff = [], isLoading } = useQuery<StaffMember[]>({
     queryKey: ['/api/staff'],
+    queryFn: async () => {
+      const response = await fetch('/api/staff');
+      if (!response.ok) {
+        throw new Error('Failed to fetch staff');
+      }
+      const data = await response.json();
+      console.log('Fetched staff data:', data);
+      return data;
+    }
   });
 
   // Filter staff based on permissions
@@ -134,8 +143,9 @@ const SchedulePage = () => {
   const filteredStaff = canViewAllSchedules 
     ? staff.filter((staffMember: StaffMember) => {
         const name = getStaffName(staffMember).toLowerCase();
-        const title = staffMember.title.toLowerCase();
-        return name.includes(searchQuery.toLowerCase()) || title.includes(searchQuery.toLowerCase());
+        const title = (staffMember.title || '').toLowerCase();
+        const query = searchQuery.toLowerCase();
+        return name.includes(query) || title.includes(query);
       })
     : staff; // For own schedule only, no need to filter by search
 
