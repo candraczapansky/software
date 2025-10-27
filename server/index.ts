@@ -260,7 +260,7 @@ async function findAvailablePort(startPort: number): Promise<number> {
     // Prefer PORT env var, otherwise default to 3002. Only scan for an open port
     // if PORT is not provided (local developer convenience). Many hosts (like Replit)
     // require binding to the exact PORT they provide.
-    const preferredPort = parseInt(process.env.PORT || '3002');
+    const preferredPort = parseInt(process.env.PORT || '3003');
     let port = preferredPort;
     let hasRetriedDueToPortConflict = false;
 
